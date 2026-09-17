@@ -1,0 +1,35 @@
+name: publish
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            rid: win-x64
+          - os: ubuntu-latest
+            rid: linux-x64
+          - os: macos-latest
+            rid: osx-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test libraries
+        run: cargo test -p clash-core -p clash-proxynet -p clash-tun
+      - name: Release
+        run: cargo build --release -p rust-clash
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-clash-${{ matrix.rid }}
+          path: |
+            target/release/rust-clash
+            target/release/rust-clash.exe
+          if-no-files-found: ignore

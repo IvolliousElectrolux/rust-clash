@@ -1,0 +1,21 @@
+[package]
+name = "rust-clash"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clash-core.workspace = true
+clash-tun.workspace = true
+gpui = "=0.2.2"
+gpui-component = "=0.5.1"
+parking_lot.workspace = true
+rfd = "0.15"
+tokio.workspace = true
+
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"
+
+[package.metadata.winres]
+ProductName = "rust-clash"
+FileDescription = "rust-clash"

@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/clash-core",
+    "crates/clash-proxynet",
+    "crates/clash-tun",
+    "crates/rust-clash",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/ArrowMeo2088/rust-clash"
+
+[workspace.dependencies]
+anyhow = "1"
+aes-gcm = "0.10"
+base64 = "0.22"
+bytes = "1"
+chacha20poly1305 = "0.10"
+flate2 = "1"
+hex = "0.4"
+hkdf = "0.12"
+hmac = "0.12"
+idna = "1"
+parking_lot = "0.12"
+rand = "0.8"
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+rustls-pki-types = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = "0.26"
+tokio-util = { version = "0.7", features = ["compat"] }
+uuid = { version = "1", features = ["v4"] }
+webpki-roots = "1"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+zeroize = "1"
+
+clash-core = { path = "crates/clash-core" }
+clash-proxynet = { path = "crates/clash-proxynet" }
+clash-tun = { path = "crates/clash-tun" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = "s"
+strip = true
