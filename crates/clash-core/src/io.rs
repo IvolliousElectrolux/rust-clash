@@ -1,4 +1,4 @@
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -179,12 +179,12 @@ impl DirectDial {
         })?;
         let host = host.trim_matches(['[', ']']).to_string();
         if let Ok(ip) = host.parse::<IpAddr>() {
-            return dial_ip(ip, port).await;
+            return InterfaceBinder::connect_happy(&[ip], port, Duration::from_secs(15)).await;
         }
         if let Some(via) = via {
             if let Ok(ips) = via.resolve_host(&host).await {
                 if !ips.is_empty() {
-                    return happy_eyeballs(&ips, port).await;
+                    return InterfaceBinder::connect_happy(&ips, port, Duration::from_secs(15)).await;
                 }
             }
         }
@@ -196,60 +196,8 @@ impl DirectDial {
             return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "host not found"));
         }
         ips.sort_by_key(|ip| ip.is_ipv6());
-        happy_eyeballs(&ips, port).await
+        InterfaceBinder::connect_happy(&ips, port, Duration::from_secs(15)).await
     }
-}
-
-async fn dial_ip(ip: IpAddr, port: u16) -> std::io::Result<TcpStream> {
-    tokio::time::timeout(
-        Duration::from_secs(15),
-        InterfaceBinder::connect(SocketAddr::new(ip, port)),
-    )
-    .await
-    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "dial timeout"))?
-}
-
-async fn happy_eyeballs(ips: &[IpAddr], port: u16) -> std::io::Result<TcpStream> {
-    if ips.len() == 1 {
-        return dial_ip(ips[0], port).await;
-    }
-    use tokio::sync::Semaphore;
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<std::io::Result<TcpStream>>();
-    let gate = std::sync::Arc::new(Semaphore::new(2));
-    let mut joins = Vec::with_capacity(ips.len());
-    for (i, ip) in ips.iter().copied().enumerate() {
-        let tx = tx.clone();
-        let gate = gate.clone();
-        let delay = Duration::from_millis(250 * i as u64);
-        joins.push(tokio::spawn(async move {
-            if !delay.is_zero() {
-                tokio::time::sleep(delay).await;
-            }
-            let Ok(_permit) = gate.acquire().await else {
-                return;
-            };
-            let _ = tx.send(dial_ip(ip, port).await);
-        }));
-    }
-    drop(tx);
-    let mut last = None;
-    let mut left = joins.len();
-    while left > 0 {
-        match rx.recv().await {
-            Some(Ok(stream)) => {
-                for j in joins {
-                    j.abort();
-                }
-                return Ok(stream);
-            }
-            Some(Err(e)) => {
-                last = Some(e);
-                left -= 1;
-            }
-            None => break,
-        }
-    }
-    Err(last.unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::HostUnreachable, "unreachable")))
 }
 
 pub struct TlsHelloCoalesce;

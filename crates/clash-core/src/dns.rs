@@ -1,10 +1,11 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
+use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio_rustls::TlsConnector;
+use tokio::sync::broadcast;
 
 use crate::net::InterfaceBinder;
 use crate::utils::{TtlLru, domain_to_ascii};
@@ -141,41 +142,239 @@ impl DohBlocklist {
     }
 }
 
+type ResolveMsg = Result<Vec<IpAddr>, String>;
+
 pub struct DohResolver {
     cache: TtlLru<Option<Vec<IpAddr>>>,
+    inflight: Mutex<HashMap<String, broadcast::Sender<ResolveMsg>>>,
 }
 
 impl DohResolver {
     pub fn new() -> Self {
         Self {
             cache: TtlLru::new(4096),
+            inflight: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn cached(&self, key: &str) -> Option<anyhow::Result<Vec<IpAddr>>> {
+        match self.cache.get(key) {
+            Some(Some(ips)) if !ips.is_empty() => Some(Ok(ips)),
+            Some(Some(_)) | Some(None) => Some(Err(anyhow::anyhow!("DNS negative cache"))),
+            None => None,
         }
     }
 
     pub async fn resolve(&self, host: &str) -> anyhow::Result<Vec<IpAddr>> {
-        if let Some(Some(ips)) = self.cache.get(host) {
-            return Ok(ips);
+        let key = domain_to_ascii(host);
+        if key.is_empty() {
+            anyhow::bail!("empty hostname");
         }
-        match self.resolve_uncached(host).await {
-            Ok(ips) => {
-                self.cache.set(host.to_string(), Some(ips.clone()), Some(Duration::from_secs(300)));
-                Ok(ips)
+        if let Ok(ip) = key.parse::<IpAddr>() {
+            return Ok(vec![ip]);
+        }
+        loop {
+            if let Some(r) = self.cached(&key) {
+                return r;
             }
-            Err(e) => {
-                self.cache.set(host.to_string(), None, Some(Duration::from_secs(30)));
-                Err(e)
+            enum Role {
+                Lead,
+                Wait(broadcast::Receiver<ResolveMsg>),
+            }
+            let role = {
+                let mut map = self.inflight.lock();
+                if let Some(r) = self.cached(&key) {
+                    return r;
+                }
+                if let Some(tx) = map.get(&key) {
+                    Role::Wait(tx.subscribe())
+                } else {
+                    let (tx, _) = broadcast::channel(1);
+                    map.insert(key.clone(), tx);
+                    Role::Lead
+                }
+            };
+            match role {
+                Role::Wait(mut rx) => match rx.recv().await {
+                    Ok(Ok(ips)) => return Ok(ips),
+                    Ok(Err(e)) => return Err(anyhow::anyhow!(e)),
+                    Err(_) => continue,
+                },
+                Role::Lead => {
+                    let result = self.resolve_uncached(&key).await;
+                    match &result {
+                        Ok(ips) => {
+                            self.cache.set(
+                                key.clone(),
+                                Some(ips.clone()),
+                                Some(Duration::from_secs(300)),
+                            );
+                        }
+                        Err(_) => {
+                            self.cache.set(key.clone(), None, Some(Duration::from_secs(30)));
+                        }
+                    }
+                    let mut map = self.inflight.lock();
+                    if let Some(tx) = map.remove(&key) {
+                        let payload = match &result {
+                            Ok(ips) => Ok(ips.clone()),
+                            Err(e) => Err(e.to_string()),
+                        };
+                        let _ = tx.send(payload);
+                    }
+                    return result;
+                }
             }
         }
     }
 
     async fn resolve_uncached(&self, host: &str) -> anyhow::Result<Vec<IpAddr>> {
-        if let Ok(r) = lookup_a("223.5.5.5:443", "dns.alidns.com", "https://223.5.5.5/resolve", host).await {
+        if !InterfaceBinder::is_bound() {
+            if let Ok(Ok(ips)) =
+                tokio::time::timeout(Duration::from_millis(800), system_lookup(host)).await
+            {
+                if !ips.is_empty() {
+                    return Ok(ips);
+                }
+            }
+        }
+        if let Ok(ips) = udp_lookup_race(host).await {
+            if !ips.is_empty() {
+                return Ok(ips);
+            }
+        }
+        if let Ok(r) =
+            lookup_a("223.5.5.5:443", "dns.alidns.com", "https://223.5.5.5/resolve", host).await
+        {
             if !r.is_empty() {
                 return Ok(r);
             }
         }
         lookup_a("1.12.12.12:443", "doh.pub", "https://doh.pub/dns-query", host).await
     }
+}
+
+async fn system_lookup(host: &str) -> anyhow::Result<Vec<IpAddr>> {
+    let mut ips = tokio::net::lookup_host((host, 0))
+        .await?
+        .map(|s| s.ip())
+        .filter(|ip| !FakeIpPool::is_fake_ip(*ip))
+        .collect::<Vec<_>>();
+    ips.sort_by_key(|ip| ip.is_ipv6());
+    if ips.is_empty() {
+        anyhow::bail!("system DNS empty for {host}");
+    }
+    Ok(ips)
+}
+
+fn next_dns_id() -> u16 {
+    static ID: AtomicU16 = AtomicU16::new(1);
+    ID.fetch_add(1, Ordering::Relaxed).max(1)
+}
+
+fn build_dns_query(id: u16, qname: &str) -> Vec<u8> {
+    let mut buf = vec![0u8; 12];
+    buf[0..2].copy_from_slice(&id.to_be_bytes());
+    buf[2..4].copy_from_slice(&0x0100u16.to_be_bytes());
+    buf[4..6].copy_from_slice(&1u16.to_be_bytes());
+    buf.extend(encode_dns_name(qname));
+    buf.extend_from_slice(&1u16.to_be_bytes());
+    buf.extend_from_slice(&1u16.to_be_bytes());
+    buf
+}
+
+fn parse_a_answers(msg: &[u8]) -> Option<Vec<IpAddr>> {
+    if msg.len() < 12 {
+        return None;
+    }
+    let flags = u16::from_be_bytes([msg[2], msg[3]]);
+    if flags & 0x8000 == 0 {
+        return None;
+    }
+    let qd = u16::from_be_bytes([msg[4], msg[5]]) as usize;
+    let an = u16::from_be_bytes([msg[6], msg[7]]) as usize;
+    let mut off = 12usize;
+    for _ in 0..qd {
+        read_dns_name(msg, &mut off)?;
+        off = off.checked_add(4)?;
+        if off > msg.len() {
+            return None;
+        }
+    }
+    let mut ips = Vec::new();
+    for _ in 0..an {
+        read_dns_name(msg, &mut off)?;
+        if off + 10 > msg.len() {
+            return None;
+        }
+        let ty = u16::from_be_bytes([msg[off], msg[off + 1]]);
+        let rdlen = u16::from_be_bytes([msg[off + 8], msg[off + 9]]) as usize;
+        off += 10;
+        if off + rdlen > msg.len() {
+            return None;
+        }
+        if ty == 1 && rdlen == 4 {
+            ips.push(IpAddr::V4(Ipv4Addr::new(
+                msg[off],
+                msg[off + 1],
+                msg[off + 2],
+                msg[off + 3],
+            )));
+        }
+        off += rdlen;
+    }
+    Some(ips)
+}
+
+async fn udp_lookup(server: &str, host: &str) -> anyhow::Result<Vec<IpAddr>> {
+    let sock = InterfaceBinder::bind_udp_v4().await?;
+    let id = next_dns_id();
+    let q = build_dns_query(id, host);
+    let dest: SocketAddr = server.parse()?;
+    sock.send_to(&q, dest).await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(800);
+    let mut buf = [0u8; 512];
+    loop {
+        let leftover = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if leftover.is_zero() {
+            anyhow::bail!("udp DNS timeout");
+        }
+        let n = tokio::time::timeout(leftover, sock.recv(&mut buf))
+            .await
+            .map_err(|_| anyhow::anyhow!("udp DNS timeout"))??;
+        if n < 12 {
+            continue;
+        }
+        let rid = u16::from_be_bytes([buf[0], buf[1]]);
+        if rid != id {
+            continue;
+        }
+        let ips = parse_a_answers(&buf[..n]).unwrap_or_default();
+        if ips.is_empty() {
+            anyhow::bail!("udp DNS empty for {host}");
+        }
+        return Ok(ips);
+    }
+}
+
+async fn udp_lookup_race(host: &str) -> anyhow::Result<Vec<IpAddr>> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<IpAddr>>(2);
+    for server in ["223.5.5.5:53", "1.12.12.12:53"] {
+        let tx = tx.clone();
+        let host = host.to_string();
+        tokio::spawn(async move {
+            if let Ok(ips) = udp_lookup(server, &host).await {
+                let _ = tx.send(ips).await;
+            }
+        });
+    }
+    drop(tx);
+    tokio::time::timeout(Duration::from_millis(900), rx.recv())
+        .await
+        .ok()
+        .flatten()
+        .filter(|ips| !ips.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("udp DNS empty"))
 }
 
 async fn lookup_a(dial: &str, sni: &str, base: &str, host: &str) -> anyhow::Result<Vec<IpAddr>> {
@@ -196,18 +395,8 @@ async fn query(dial: &str, sni: &str, url: &str) -> anyhow::Result<Vec<IpAddr>> 
 async fn query_inner(dial: &str, sni: &str, url: &str) -> anyhow::Result<Vec<IpAddr>> {
     let addr: SocketAddr = dial.parse()?;
     let tcp = InterfaceBinder::connect(addr).await?;
-    clash_proxynet::install_crypto_provider();
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let cfg = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()?
-    .with_root_certificates(roots)
-    .with_no_client_auth();
-    let connector = TlsConnector::from(Arc::new(cfg));
-    let name = rustls_pki_types::ServerName::try_from(sni.to_string())?;
-    let mut tls = connector.connect(name, tcp).await?;
+    let connector = clash_proxynet::TlsConnector::new(false, &[])?;
+    let mut tls = connector.connect(sni, tcp).await?;
     let uri = url::Url::parse(url)?;
     let path = format!("{}?{}", uri.path(), uri.query().unwrap_or(""));
     let req = format!(
@@ -438,9 +627,45 @@ mod tests {
     }
 
     #[test]
+    fn parse_udp_a_from_named_response() {
+        let ip = Ipv4Addr::new(1, 2, 3, 4);
+        let msg = build_named_a_response(42, "example.com", ip);
+        let ips = parse_a_answers(&msg).expect("parse A");
+        assert_eq!(ips, vec![IpAddr::V4(ip)]);
+        let q = build_dns_query(7, "Example.COM");
+        assert_eq!(&q[0..2], &7u16.to_be_bytes());
+        assert!(q.len() > 12);
+    }
+
+    #[test]
     fn empty_aaaa_is_success_not_nxdomain() {
         let msg = build_empty_dns(7, "www.google.com", 28);
         assert_eq!(&msg[2..4], &0x8180u16.to_be_bytes());
         assert_eq!(u16::from_be_bytes([msg[6], msg[7]]), 0);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn live_resolve_is_fast_after_first() {
+        let r = DohResolver::new();
+        let t0 = std::time::Instant::now();
+        let ips = r
+            .resolve("www.gstatic.com")
+            .await
+            .expect("resolve gstatic");
+        let first = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        let ips2 = r.resolve("www.gstatic.com").await.expect("cached");
+        let cached = t1.elapsed();
+        assert!(!ips.is_empty());
+        assert_eq!(ips, ips2);
+        assert!(
+            cached.as_millis() < 20,
+            "cache hit should be microseconds, got {cached:?} (first lookup {first:?}, ips {ips:?})"
+        );
+        assert!(
+            first.as_millis() < 1500,
+            "first lookup too slow: {first:?} ips {ips:?}"
+        );
     }
 }

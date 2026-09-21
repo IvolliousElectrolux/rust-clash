@@ -70,6 +70,22 @@ pub struct TlsConnector {
 
 impl TlsConnector {
     pub fn new(insecure: bool, alpn: &[String]) -> Result<Self, ProxyError> {
+        use parking_lot::Mutex;
+        use std::collections::HashMap;
+        static CACHE: std::sync::OnceLock<Mutex<HashMap<(bool, Vec<u8>), TokioTls>>> =
+            std::sync::OnceLock::new();
+        let key = (
+            insecure,
+            alpn.iter().flat_map(|s| {
+                let mut v = s.as_bytes().to_vec();
+                v.push(0);
+                v
+            }).collect::<Vec<_>>(),
+        );
+        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Some(inner) = cache.lock().get(&key).cloned() {
+            return Ok(Self { inner });
+        }
         let config = if insecure {
             client_builder()?
                 .dangerous()
@@ -86,9 +102,9 @@ impl TlsConnector {
         if !alpn.is_empty() {
             config.alpn_protocols = alpn.iter().map(|s| s.as_bytes().to_vec()).collect();
         }
-        Ok(Self {
-            inner: TokioTls::from(Arc::new(config)),
-        })
+        let inner = TokioTls::from(Arc::new(config));
+        cache.lock().insert(key, inner.clone());
+        Ok(Self { inner })
     }
 
     pub async fn connect<S>(

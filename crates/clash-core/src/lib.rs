@@ -23,7 +23,7 @@ pub use io::{DirectDial, Relay, TrafficCounters, TlsHelloCoalesce};
 pub use net::{DirectNetwork, InterfaceBinder, PhysicalEndpoint};
 pub use outbound::{HealthCheckResult, HealthChecker, HealthStatus, OutboundDialer};
 pub use paths::AppPaths;
-pub use ui_state::{LaunchFlags, SavedNode, UiMode, UiState};
+pub use ui_state::{LaunchFlags, SavedNode, UiMode, UiState, UiTheme};
 pub use rules::{action_for_ip, join_host_port, try_split_host_port, with_port, RuleAction, RuleDb};
 pub use utils::hidden_command;
 

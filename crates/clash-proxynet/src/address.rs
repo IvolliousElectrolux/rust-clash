@@ -41,4 +41,28 @@ impl ProxyAddress {
         dest[2..2 + bytes.len()].copy_from_slice(bytes);
         Ok(2 + bytes.len())
     }
+
+    pub fn write_socks_port_last(host: &str, port: u16, dest: &mut [u8]) -> Result<usize, ProxyError> {
+        let n = Self::write_type_and_address(host, dest, 0x01, 0x03, 0x04)?;
+        if dest.len() < n + 2 {
+            return Err(ProxyError::new(
+                ProxyErrorCode::StringTooLong,
+                "address buffer too small",
+            ));
+        }
+        dest[n..n + 2].copy_from_slice(&port.to_be_bytes());
+        Ok(n + 2)
+    }
+
+    pub fn write_socks_port_first(host: &str, port: u16, dest: &mut [u8]) -> Result<usize, ProxyError> {
+        if dest.len() < 2 {
+            return Err(ProxyError::new(
+                ProxyErrorCode::StringTooLong,
+                "address buffer too small",
+            ));
+        }
+        dest[0..2].copy_from_slice(&port.to_be_bytes());
+        let n = Self::write_type_and_address(host, &mut dest[2..], 0x01, 0x03, 0x04)?;
+        Ok(n + 2)
+    }
 }

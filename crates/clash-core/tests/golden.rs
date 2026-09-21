@@ -2,7 +2,7 @@ use clash_core::{action_for_ip, FakeIpPool, NodeCatalog, NodeFilter, ProxyNode, 
 use std::net::{IpAddr, Ipv4Addr};
 
 #[test]
-fn clash_yaml_filters_unsupported_and_keeps_vless_trojan() {
+fn clash_yaml_keeps_leaf_outbounds_and_drops_grpc() {
     let yaml = r#"
 proxies:
   - name: ok-vless
@@ -25,18 +25,33 @@ proxies:
     port: 443
     password: secret
     network: ws
-  - name: drop-ss
+  - name: ok-ss
     type: ss
     server: 9.9.9.9
     port: 8388
+    cipher: chacha20-ietf-poly1305
+    password: x
+  - name: ok-vmess
+    type: vmess
+    server: 8.8.8.8
+    port: 443
+    uuid: 11111111-1111-1111-1111-111111111111
+    alterId: 0
+    cipher: auto
+  - name: drop-hysteria
+    type: hysteria2
+    server: 1.1.1.1
+    port: 443
     password: x
 "#;
     let nodes = NodeCatalog::parse(yaml.as_bytes());
     let names: Vec<_> = nodes.iter().map(|n| n.name.as_str()).collect();
     assert!(names.contains(&"ok-vless"));
     assert!(names.contains(&"ok-trojan"));
+    assert!(names.contains(&"ok-ss"));
+    assert!(names.contains(&"ok-vmess"));
     assert!(!names.contains(&"drop-grpc"));
-    assert!(!names.contains(&"drop-ss"));
+    assert!(!names.contains(&"drop-hysteria"));
 }
 
 #[test]
@@ -69,8 +84,26 @@ fn node_filter_rejects_bad_flow() {
         ws_path: None,
         ws_host: None,
         security: Some("tls".into()),
+        ..Default::default()
     };
     assert!(!NodeFilter::accept(&n));
+}
+
+#[test]
+fn share_link_ss_and_vmess() {
+    let method_pass = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        "chacha20-ietf-poly1305:secret",
+    );
+    let ss = format!("ss://{method_pass}@example.com:8388#ss-node");
+    let vmess_json = r#"{"v":"2","ps":"vm-node","add":"1.2.3.4","port":"443","id":"11111111-1111-1111-1111-111111111111","aid":"0","net":"tcp","tls":"tls","scy":"auto"}"#;
+    let vmess = format!(
+        "vmess://{}",
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, vmess_json)
+    );
+    let nodes = NodeCatalog::parse(format!("{ss}\n{vmess}").as_bytes());
+    assert!(nodes.iter().any(|n| n.type_name == "ss" && n.server == "example.com"));
+    assert!(nodes.iter().any(|n| n.type_name == "vmess" && n.server == "1.2.3.4"));
 }
 
 #[test]

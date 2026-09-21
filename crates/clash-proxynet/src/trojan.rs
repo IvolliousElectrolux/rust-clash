@@ -48,3 +48,76 @@ pub fn build_request(
     buffer[offset + 1] = b'\n';
     Ok(offset + 2)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    #[tokio::test]
+    async fn trojan_tcp_tunnels_payload() {
+        let password = "trojan-secret";
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let expect_hash = {
+            let mut h = [0u8; SHA224_HEX_SIZE];
+            sha224_hex_lower(password.as_bytes(), &mut h);
+            h
+        };
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut hash = [0u8; SHA224_HEX_SIZE + 2];
+            socket.read_exact(&mut hash).await.unwrap();
+            assert_eq!(&hash[..SHA224_HEX_SIZE], &expect_hash);
+            assert_eq!(&hash[SHA224_HEX_SIZE..], b"\r\n");
+            let mut cmd = [0u8; 1];
+            socket.read_exact(&mut cmd).await.unwrap();
+            assert_eq!(cmd[0], CMD_TCP);
+            let mut atyp = [0u8; 1];
+            socket.read_exact(&mut atyp).await.unwrap();
+            let n = match atyp[0] {
+                ATYP_IPV4 => 4,
+                ATYP_IPV6 => 16,
+                ATYP_DOMAIN => {
+                    let mut len = [0u8; 1];
+                    socket.read_exact(&mut len).await.unwrap();
+                    len[0] as usize
+                }
+                other => panic!("{other}"),
+            };
+            let mut rest = vec![0u8; n + 2 + 2];
+            socket.read_exact(&mut rest).await.unwrap();
+            assert_eq!(&rest[n + 2..], b"\r\n");
+            let mut buf = [0u8; 32];
+            let n = socket.read(&mut buf).await.unwrap();
+            socket.write_all(&buf[..n]).await.unwrap();
+            socket.flush().await.unwrap();
+            let _ = tokio::io::AsyncWriteExt::shutdown(&mut socket).await;
+            let mut hold = [0u8; 1];
+            let _ = socket.read(&mut hold).await;
+        });
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let opts = TrojanOptions {
+            password: password.into(),
+            host: addr.ip().to_string(),
+            port: addr.port(),
+            transport: "tcp".into(),
+            path: None,
+            host_header: None,
+            sni: None,
+            alpn: Vec::new(),
+            allow_insecure: false,
+        };
+        let mut stream = establish_trojan(Box::pin(tcp), &opts, "example.com", 443)
+            .await
+            .unwrap();
+        stream.write_all(b"ping-trojan").await.unwrap();
+        stream.flush().await.unwrap();
+        let mut buf = [0u8; 11];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping-trojan");
+        let _ = stream.shutdown().await;
+        server.await.unwrap();
+    }
+}

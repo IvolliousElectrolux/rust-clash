@@ -196,3 +196,85 @@ impl AsyncWrite for VlessResponseStream {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::options::VlessOptions;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    #[tokio::test]
+    async fn vless_none_tunnels_payload() {
+        let uuid = "11111111-1111-1111-1111-111111111111";
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let uuid_s = uuid.to_string();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = [0u8; 18];
+            socket.read_exact(&mut head).await.unwrap();
+            assert_eq!(head[0], 0x00);
+            let mut expect = [0u8; 16];
+            assert!(crate::crypto::uuid_write_be(&uuid_s, &mut expect));
+            assert_eq!(&head[1..17], &expect);
+            let addon = head[17] as usize;
+            if addon > 0 {
+                let mut skip = vec![0u8; addon];
+                socket.read_exact(&mut skip).await.unwrap();
+            }
+            let mut cmd_port = [0u8; 3];
+            socket.read_exact(&mut cmd_port).await.unwrap();
+            assert_eq!(cmd_port[0], CMD_TCP);
+            let mut atyp = [0u8; 1];
+            socket.read_exact(&mut atyp).await.unwrap();
+            let n = match atyp[0] {
+                ATYP_IPV4 => 4,
+                ATYP_IPV6 => 16,
+                ATYP_DOMAIN => {
+                    let mut len = [0u8; 1];
+                    socket.read_exact(&mut len).await.unwrap();
+                    len[0] as usize
+                }
+                other => panic!("{other}"),
+            };
+            let mut rest = vec![0u8; n];
+            socket.read_exact(&mut rest).await.unwrap();
+            socket.write_all(&[VERSION, 0]).await.unwrap();
+            let mut buf = [0u8; 32];
+            let n = socket.read(&mut buf).await.unwrap();
+            socket.write_all(&buf[..n]).await.unwrap();
+            socket.flush().await.unwrap();
+            let _ = tokio::io::AsyncWriteExt::shutdown(&mut socket).await;
+            let mut hold = [0u8; 1];
+            let _ = socket.read(&mut hold).await;
+        });
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let opts = VlessOptions {
+            id: uuid.into(),
+            host: addr.ip().to_string(),
+            port: addr.port(),
+            security: crate::options::VlessSecurity::None,
+            transport: "tcp".into(),
+            path: None,
+            host_header: None,
+            sni: None,
+            alpn: Vec::new(),
+            flow: None,
+            fingerprint: None,
+            reality_public_key: None,
+            reality_short_id: None,
+            allow_insecure: false,
+        };
+        let mut stream = establish_vless(Box::pin(tcp), &opts, "example.com", 80)
+            .await
+            .unwrap();
+        stream.write_all(b"ping-vless").await.unwrap();
+        stream.flush().await.unwrap();
+        let mut buf = [0u8; 10];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping-vless");
+        let _ = stream.shutdown().await;
+        server.await.unwrap();
+    }
+}
+

@@ -1,24 +1,33 @@
-//! Embedded outbound stack: VLESS / Trojan / REALITY / Vision.
+//! Embedded outbound stack: VLESS / Trojan / REALITY / Vision / Shadowsocks / VMess / SOCKS / HTTP.
 
 mod address;
 mod crypto;
 mod error;
+mod http_connect;
+mod obfs;
 mod options;
 mod reality;
 mod shared;
+mod socks;
+mod ss;
 mod tls;
 mod transport;
 mod trojan;
 mod vision;
 mod vless;
+mod vmess;
 
 pub use address::ProxyAddress;
 pub use crypto::{sha224_hex_lower, uuid_write_be, UUID_SIZE};
 pub use error::{ProxyError, ProxyErrorCode};
-pub use options::{TrojanOptions, VlessOptions, VlessSecurity};
+pub use options::{
+    HttpProxyOptions, OutboundKind, SocksOptions, SsOptions, TrojanOptions, VlessOptions,
+    VlessSecurity, VmessOptions,
+};
 pub use reality::RealityTlsStream;
 pub use shared::SharedStream;
-pub use tls::install_crypto_provider;
+pub use ss::supported_cipher as ss_supported_cipher;
+pub use tls::{install_crypto_provider, TlsConnector};
 pub use transport::{TransportKind, resolve_host_header, resolve_transport};
 pub use vision::VISION_FLOW;
 
@@ -29,10 +38,13 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
-use crate::tls::TlsConnector;
+use crate::http_connect::dial_http_connect;
+use crate::socks::dial_socks5;
+use crate::ss::dial_ss;
 use crate::transport::apply_transport;
 use crate::trojan::establish_trojan;
 use crate::vless::establish_vless;
+use crate::vmess::dial_vmess;
 
 pub trait AsyncIo: AsyncRead + AsyncWrite + Unpin + Send {
     fn vision_detach(&mut self, leftover: Vec<u8>) -> Option<BoxedStream> {
@@ -193,32 +205,52 @@ pub async fn dial_trojan(
 }
 
 pub async fn dial(
-    node_type: &str,
+    kind: &OutboundKind,
     tcp: TcpStream,
-    vless: Option<&VlessOptions>,
-    trojan: Option<&TrojanOptions>,
     dest_host: &str,
     dest_port: u16,
     time_limit: Duration,
 ) -> Result<BoxedStream, ProxyError> {
     let work = async {
-        match node_type.to_ascii_lowercase().as_str() {
-            "vless" => {
-                let opts = vless.ok_or_else(|| {
-                    ProxyError::new(ProxyErrorCode::AuthRequired, "VLESS node missing uuid")
-                })?;
-                dial_vless(tcp, opts, dest_host, dest_port).await
+        match kind {
+            OutboundKind::Vless(opts) => dial_vless(tcp, opts, dest_host, dest_port).await,
+            OutboundKind::Trojan(opts) => dial_trojan(tcp, opts, dest_host, dest_port).await,
+            OutboundKind::Shadowsocks(opts) => {
+                let layered = layer_transport(
+                    Box::pin(tcp),
+                    opts.tls,
+                    opts.sni_or_host(),
+                    opts.allow_insecure,
+                    &opts.alpn,
+                    &opts.transport,
+                    opts.path.as_deref(),
+                    opts.host_header.as_deref(),
+                    &opts.host,
+                    opts.sni.as_deref(),
+                )
+                .await?;
+                dial_ss(layered, opts, dest_host, dest_port).await
             }
-            "trojan" => {
-                let opts = trojan.ok_or_else(|| {
-                    ProxyError::new(ProxyErrorCode::AuthRequired, "Trojan node missing password")
-                })?;
-                dial_trojan(tcp, opts, dest_host, dest_port).await
+            OutboundKind::Vmess(opts) => {
+                let layered = layer_transport(
+                    Box::pin(tcp),
+                    opts.tls,
+                    opts.sni_or_host(),
+                    opts.allow_insecure,
+                    &opts.alpn,
+                    &opts.transport,
+                    opts.path.as_deref(),
+                    opts.host_header.as_deref(),
+                    &opts.host,
+                    opts.sni.as_deref(),
+                )
+                .await?;
+                dial_vmess(layered, opts, dest_host, dest_port).await
             }
-            other => Err(ProxyError::new(
-                ProxyErrorCode::InvalidResponse,
-                format!("Outbound type {other}"),
-            )),
+            OutboundKind::Socks5(opts) => dial_socks5(Box::pin(tcp), opts, dest_host, dest_port).await,
+            OutboundKind::Http(opts) => {
+                dial_http_connect(Box::pin(tcp), opts, dest_host, dest_port).await
+            }
         }
     };
     match timeout(time_limit, work).await {
@@ -228,6 +260,32 @@ pub async fn dial(
             "proxy dial timed out",
         )),
     }
+}
+
+async fn layer_transport(
+    mut layered: BoxedStream,
+    tls: bool,
+    sni: &str,
+    insecure: bool,
+    alpn: &[String],
+    transport: &str,
+    path: Option<&str>,
+    host_header: Option<&str>,
+    host: &str,
+    sni_opt: Option<&str>,
+) -> Result<BoxedStream, ProxyError> {
+    if tls {
+        layered = tls_wrap(layered, sni, insecure, alpn).await?;
+    }
+    let kind = resolve_transport(transport);
+    if kind == TransportKind::Unsupported {
+        return Err(ProxyError::new(
+            ProxyErrorCode::TransportUpgradeFailed,
+            format!("transport '{transport}' is not supported"),
+        ));
+    }
+    let hh = resolve_host_header(host_header, sni_opt, host);
+    apply_transport(kind, layered, path, &hh).await
 }
 
 async fn tls_wrap(

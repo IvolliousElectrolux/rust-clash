@@ -2,33 +2,34 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod tray;
+mod theme;
+
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use clash_core::{
-    inbound, ContentStore, DirectNetwork, DohResolver, HealthCheckResult, HealthChecker,
+    inbound, AppPaths, ContentStore, DirectNetwork, DohResolver, HealthCheckResult, HealthChecker,
     HealthStatus, LaunchFlags, NodeCatalog, OutboundDialer, ProfileKind, ProfileStore, ProxyNode,
     ProxyService, RuleDb, SavedNode, SubscriptionClient, UiMode, UiState,
 };
 use clash_tun::{ensure_wintun_extracted, recover_orphaned_os_state, TunService};
 use gpui::prelude::*;
 use gpui::{
-    div, px, rgb, size, App, Application, Bounds, ClickEvent, Context, Entity, MouseButton,
-    SharedString, TitlebarOptions, Window, WindowBounds, WindowControlArea, WindowOptions,
+    actions, div, px, rgb, size, App, Application, Bounds, ClickEvent, ClipboardItem, Context,
+    Entity, KeyBinding, MouseButton, SharedString, TitlebarOptions, Window, WindowBounds,
+    WindowControlArea, WindowOptions,
 };
 use gpui_component::input::{Input, InputState};
-use gpui_component::{Root, Theme, ThemeMode};
+use gpui_component::Root;
+
+actions!(app, [Quit]);
+
+static ALLOW_QUIT: AtomicBool = AtomicBool::new(false);
 
 const TITLE_BAR_H: f32 = 34.;
 use parking_lot::Mutex;
-
-const UI_BG: u32 = 0xf4f4f5;
-const UI_FG: u32 = 0x18181b;
-const UI_MUTED: u32 = 0x52525b;
-const UI_CHIP: u32 = 0xe4e4e7;
-const UI_CHIP_HOVER: u32 = 0xd4d4d8;
-const UI_CARD: u32 = 0xffffff;
-const UI_BORDER: u32 = 0xd4d4d8;
 
 struct AppCore {
     proxy: Arc<ProxyService>,
@@ -67,6 +68,8 @@ struct MainView {
     enhance_busy: bool,
     name_input: Entity<InputState>,
     url_input: Entity<InputState>,
+    tray: tray::Tray,
+    window_visible: bool,
 }
 
 impl MainView {
@@ -78,6 +81,8 @@ impl MainView {
     ) -> Self {
         let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("可留空"));
         let url_input = cx.new(|cx| InputState::new(window, cx).placeholder("https://..."));
+        let saved = UiState::load();
+        let (tray, mut tray_rx) = tray::Tray::spawn();
         let mut this = Self {
             core,
             nodes: Vec::new(),
@@ -99,8 +104,9 @@ impl MainView {
             enhance_busy: false,
             name_input,
             url_input,
+            tray,
+            window_visible: true,
         };
-        let saved = UiState::load();
         this.reload_nodes();
         this.apply_saved_node(&saved);
         this.refresh_quota();
@@ -110,6 +116,22 @@ impl MainView {
             saved.mode
         };
         this.restore_mode(mode, cx);
+        this.sync_tray();
+        window.on_window_should_close(cx, {
+            let view = cx.weak_entity();
+            move |window, cx| {
+                view.update(cx, |this, cx| this.on_close_requested(window, cx))
+                    .unwrap_or(true)
+            }
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            while let Some(ev) = tray_rx.recv().await {
+                let _ = cx.update(|window, cx| {
+                    let _ = this.update(cx, |this, cx| this.handle_tray(ev, window, cx));
+                });
+            }
+        })
+        .detach();
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
@@ -178,14 +200,15 @@ impl MainView {
 impl Render for MainView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let enhance_ok = cfg!(windows);
+        let p = theme::current(cx);
         div()
             .relative()
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgb(UI_BG))
-            .text_color(rgb(UI_FG))
-            .child(title_bar(window.is_maximized()))
+            .bg(rgb(p.bg))
+            .text_color(rgb(p.fg))
+            .child(title_bar(window.is_maximized(), cx))
             .child(
                 div()
                     .flex()
@@ -237,6 +260,7 @@ impl MainView {
             .active()
             .map(|p| p.kind == ProfileKind::Cloud)
             .unwrap_or(false);
+        let p = theme::current(cx);
         div()
             .flex()
             .flex_row()
@@ -244,14 +268,18 @@ impl MainView {
             .flex_nowrap()
             .items_center()
             .gap_2()
-            .child(chip("添加订阅", cx.listener(|this, _, window, cx| {
-                this.show_dialog = true;
-                this.dialog_status = "".into();
-                this.dialog_path = "".into();
-                this.name_input.update(cx, |s, cx| s.set_value("", window, cx));
-                this.url_input.update(cx, |s, cx| s.set_value("", window, cx));
-                cx.notify();
-            })))
+            .child(chip(
+                "添加订阅",
+                cx.listener(|this, _, window, cx| {
+                    this.show_dialog = true;
+                    this.dialog_status = "".into();
+                    this.dialog_path = "".into();
+                    this.name_input.update(cx, |s, cx| s.set_value("", window, cx));
+                    this.url_input.update(cx, |s, cx| s.set_value("", window, cx));
+                    cx.notify();
+                }),
+                cx,
+            ))
             .child(chip_label(
                 "profile-select",
                 active,
@@ -259,23 +287,32 @@ impl MainView {
                     this.show_profiles = !this.show_profiles;
                     cx.notify();
                 }),
+                cx,
             ))
             .when(cloud, |d| {
-                d.child(chip("更新订阅", cx.listener(|this, _, _, cx| this.update_profile(cx))))
+                d.child(chip(
+                    "更新订阅",
+                    cx.listener(|this, _, _, cx| this.update_profile(cx)),
+                    cx,
+                ))
             })
             .when(!names.is_empty(), |d| {
-                d.child(chip("删除", cx.listener(|this, _, _, cx| this.delete_profile(cx))))
+                d.child(chip(
+                    "删除",
+                    cx.listener(|this, _, _, cx| this.delete_profile(cx)),
+                    cx,
+                ))
             })
             .child(
                 div()
                     .text_sm()
-                    .text_color(rgb(UI_MUTED))
+                    .text_color(rgb(p.muted))
                     .child(self.quota.clone()),
             )
             .child(
                 div()
                     .text_sm()
-                    .text_color(rgb(UI_MUTED))
+                    .text_color(rgb(p.muted))
                     .child(self.expire.clone()),
             )
     }
@@ -289,6 +326,7 @@ impl MainView {
             .iter()
             .map(|p| p.name.clone())
             .collect();
+        let p = theme::current(cx);
         div()
             .id("profile-overlay")
             .absolute()
@@ -310,11 +348,11 @@ impl MainView {
                     .min_w(px(180.))
                     .max_h(px(280.))
                     .overflow_y_scroll()
-                    .bg(rgb(UI_CARD))
+                    .bg(rgb(p.card))
                     .border_1()
-                    .border_color(rgb(UI_BORDER))
+                    .border_color(rgb(p.border))
                     .rounded_md()
-                    .text_color(rgb(UI_FG))
+                    .text_color(rgb(p.fg))
                     .occlude()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .children(names.into_iter().enumerate().map(|(i, n)| {
@@ -324,15 +362,9 @@ impl MainView {
                             .px_3()
                             .py_1()
                             .cursor_pointer()
-                            .hover(|s| s.bg(rgb(UI_BG)))
+                            .hover(move |s| s.bg(rgb(p.bg)))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.core.profiles.lock().set_default(&name);
-                                this.show_profiles = false;
-                                this.reload_nodes();
-                                this.refresh_quota();
-                                this.core.proxy.abort_active();
-                                this.persist();
-                                cx.notify();
+                                this.switch_profile(&name, cx);
                             }))
                             .child(n)
                     })),
@@ -357,17 +389,18 @@ impl MainView {
         } else {
             "关闭"
         };
+        let p = theme::current(cx);
         let proxy_color = if self.proxy_on {
-            rgb(0x50c878)
+            rgb(p.success)
         } else {
-            rgb(0xdc5050)
+            rgb(p.danger)
         };
         let enhance_color = if !enhance_ok {
-            rgb(0x969696)
+            rgb(p.muted)
         } else if self.enhance_on {
-            rgb(0x50c878)
+            rgb(p.success)
         } else {
-            rgb(0xdc5050)
+            rgb(p.danger)
         };
         div()
             .flex()
@@ -380,6 +413,7 @@ impl MainView {
                 "health-check",
                 health_label,
                 cx.listener(|this, _, _, cx| this.toggle_health(cx)),
+                cx,
             ))
             .child(
                 div()
@@ -390,8 +424,8 @@ impl MainView {
                     .gap_1()
                     .cursor_pointer()
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_proxy(cx)))
-                    .child(div().text_color(rgb(UI_FG)).child("代理模式"))
-                    .child(toggle_knob("proxy-toggle", self.proxy_on))
+                    .child(div().text_color(rgb(p.fg)).child("代理模式"))
+                    .child(toggle_knob("proxy-toggle", self.proxy_on, cx))
                     .child(div().text_color(proxy_color).child(proxy_state)),
             )
             .child(
@@ -407,28 +441,30 @@ impl MainView {
                             this.toggle_enhance(cx);
                         }
                     }))
-                    .child(div().text_color(rgb(UI_FG)).child("增强模式"))
+                    .child(div().text_color(rgb(p.fg)).child("增强模式"))
                     .child(toggle_knob(
                         "enhance-toggle",
                         self.enhance_on && enhance_ok,
+                        cx,
                     ))
                     .child(div().text_color(enhance_color).child(enhance_state)),
             )
             .child(
                 div()
-                    .text_color(rgb(0xdc5050))
+                    .text_color(rgb(p.danger))
                     .child(self.error.clone()),
             )
             .child(
                 div()
                     .text_sm()
-                    .text_color(rgb(UI_MUTED))
+                    .text_color(rgb(p.muted))
                     .child(self.speed.clone()),
             )
     }
 
     fn row_nodes(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let card_w = node_card_width(window);
+        let p = theme::current(cx);
         div()
             .id("node-list")
             .flex_1()
@@ -453,7 +489,7 @@ impl MainView {
                 };
                 let name = n.node.name.clone();
                 let lat = n.latency.clone();
-                let lat_color = latency_color(n.health);
+                let lat_color = latency_color(n.health, p.muted);
                 div()
                     .id(("node", i))
                     .w(card_w)
@@ -461,18 +497,18 @@ impl MainView {
                     .px_2()
                     .border_1()
                     .border_color(if selected {
-                        rgb(0x3b82f6)
+                        rgb(p.accent)
                     } else {
-                        rgb(UI_BORDER)
+                        rgb(p.border)
                     })
                     .rounded_md()
-                    .bg(rgb(UI_CARD))
+                    .bg(rgb(p.card))
                     .flex()
                     .flex_row()
                     .items_center()
                     .justify_between()
                     .text_sm()
-                    .text_color(rgb(UI_FG))
+                    .text_color(rgb(p.fg))
                     .when(!info, |d| {
                         d.cursor_pointer()
                             .on_click(cx.listener(move |this, _, _, cx| this.select_node(i, cx)))
@@ -484,18 +520,19 @@ impl MainView {
                             .min_w(px(0.))
                             .child(
                                 div()
-                                    .text_color(rgb(UI_FG))
+                                    .text_color(rgb(p.fg))
                                     .overflow_hidden()
                                     .text_ellipsis()
                                     .child(name),
                             )
-                            .child(div().text_xs().text_color(rgb(0x71717a)).child(proto)),
+                            .child(div().text_xs().text_color(rgb(p.proto)).child(proto)),
                     )
                     .child(div().text_xs().text_color(rgb(lat_color)).child(lat))
             }))
     }
 
     fn dialog(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = theme::current(cx);
         div()
             .absolute()
             .inset_0()
@@ -513,9 +550,9 @@ impl MainView {
                     .w(px(440.))
                     .h(px(260.))
                     .p_4()
-                    .bg(rgb(UI_CARD))
+                    .bg(rgb(p.card))
                     .rounded_md()
-                    .text_color(rgb(UI_FG))
+                    .text_color(rgb(p.fg))
                     .flex()
                     .flex_col()
                     .gap_2()
@@ -530,6 +567,7 @@ impl MainView {
                                     this.dialog_cloud = true;
                                     cx.notify();
                                 }),
+                                cx,
                             ))
                             .child(chip(
                                 "本地订阅",
@@ -537,6 +575,7 @@ impl MainView {
                                     this.dialog_cloud = false;
                                     cx.notify();
                                 }),
+                                cx,
                             )),
                     )
                     .child("订阅名称（可留空）")
@@ -565,20 +604,26 @@ impl MainView {
                                 }
                                 cx.notify();
                             }),
+                            cx,
                         ))
                     })
-                    .child(div().text_color(rgb(0xdc5050)).child(self.dialog_status.clone()))
+                    .child(div().text_color(rgb(p.danger)).child(self.dialog_status.clone()))
                     .child(
                         div()
                             .flex()
                             .gap_2()
-                            .child(chip("确定", cx.listener(|this, _, _, cx| this.confirm_dialog(cx))))
+                            .child(chip(
+                                "确定",
+                                cx.listener(|this, _, _, cx| this.confirm_dialog(cx)),
+                                cx,
+                            ))
                             .child(chip(
                                 "取消",
                                 cx.listener(|this, _, _, cx| {
                                     this.show_dialog = false;
                                     cx.notify();
                                 }),
+                                cx,
                             )),
                     ),
             )
@@ -831,11 +876,11 @@ impl MainView {
                     this.enhance_on = false;
                     this.error = last_err.unwrap_or_else(|| "enhance failed".into()).into();
                     if keep_intent {
-                        UiState {
-                            mode: UiMode::Enhance,
-                            node: this.saved_node(),
-                        }
-                        .save();
+                        UiState::patch(|s| {
+                            s.mode = UiMode::Enhance;
+                            s.node = this.saved_node();
+                        });
+                        this.sync_tray();
                     } else {
                         this.persist();
                     }
@@ -1116,21 +1161,88 @@ impl MainView {
     }
 
     fn persist(&self) {
-        let mode = if self.enhance_on {
-            UiMode::Enhance
-        } else if self.proxy_on {
-            UiMode::Proxy
-        } else {
-            UiMode::Off
-        };
-        UiState {
-            mode,
-            node: self.saved_node(),
+        UiState::patch(|s| {
+            s.mode = if self.enhance_on {
+                UiMode::Enhance
+            } else if self.proxy_on {
+                UiMode::Proxy
+            } else {
+                UiMode::Off
+            };
+            s.node = self.saved_node();
+            s.window_visible = self.window_visible;
+        });
+        self.sync_tray();
+    }
+
+    fn sync_tray(&self) {
+        let profiles = self.core.profiles.lock();
+        self.tray.update_menu(tray::TrayMenuState {
+            proxy_on: self.proxy_on,
+            enhance_on: self.enhance_on,
+            enhance_ok: cfg!(windows),
+            profiles: profiles.profiles().iter().map(|p| p.name.clone()).collect(),
+            active_profile: profiles.active().map(|p| p.name.clone()),
+        });
+    }
+
+    fn on_close_requested(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if ALLOW_QUIT.load(Ordering::SeqCst) {
+            return true;
         }
-        .save();
+        self.set_window_visible(false, window, cx);
+        false
+    }
+
+    fn set_window_visible(&mut self, show: bool, window: &mut Window, cx: &mut Context<Self>) {
+        tray::apply_window_shown(window, show);
+        self.window_visible = show;
+        self.persist();
+        cx.notify();
+    }
+
+    fn handle_tray(&mut self, ev: tray::TrayEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match ev {
+            tray::TrayEvent::ToggleWindow => {
+                let show = !tray::window_is_shown(window);
+                self.set_window_visible(show, window, cx);
+            }
+            tray::TrayEvent::ShowWindow => self.set_window_visible(true, window, cx),
+            tray::TrayEvent::ToggleProxy => self.toggle_proxy(cx),
+            tray::TrayEvent::ToggleTun => {
+                if !tray::window_is_shown(window) {
+                    self.set_window_visible(true, window, cx);
+                }
+                self.toggle_enhance(cx);
+            }
+            tray::TrayEvent::SwitchProfile(name) => self.switch_profile(&name, cx),
+            tray::TrayEvent::OpenDataDir => cx.open_with_system(&AppPaths::user_data_dir()),
+            tray::TrayEvent::OpenAppDir => cx.open_with_system(&AppPaths::base_dir()),
+            tray::TrayEvent::CopyEnv => {
+                let port = clash_core::INBOUND_PORT;
+                let text = format!(
+                    "set http_proxy=http://127.0.0.1:{port}\r\nset https_proxy=http://127.0.0.1:{port}\r\nset ALL_PROXY=http://127.0.0.1:{port}"
+                );
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            tray::TrayEvent::OpenTheme => theme::open_picker(cx),
+            tray::TrayEvent::Restart => request_restart(cx),
+            tray::TrayEvent::Quit => request_quit(cx),
+        }
+    }
+
+    fn switch_profile(&mut self, name: &str, cx: &mut Context<Self>) {
+        self.core.profiles.lock().set_default(name);
+        self.show_profiles = false;
+        self.reload_nodes();
+        self.refresh_quota();
+        self.core.proxy.abort_active();
+        self.persist();
+        cx.notify();
     }
 
     fn elevate_dialog(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = theme::current(cx);
         div()
             .id("elevate-overlay")
             .absolute()
@@ -1150,9 +1262,9 @@ impl MainView {
                     .id("elevate-dialog")
                     .w(px(400.))
                     .p_4()
-                    .bg(rgb(UI_CARD))
+                    .bg(rgb(p.card))
                     .rounded_md()
-                    .text_color(rgb(UI_FG))
+                    .text_color(rgb(p.fg))
                     .flex()
                     .flex_col()
                     .gap_3()
@@ -1162,7 +1274,7 @@ impl MainView {
                     .child(
                         div()
                             .text_sm()
-                            .text_color(rgb(UI_MUTED))
+                            .text_color(rgb(p.muted))
                             .child("增强模式需要管理员权限, 是否重启并以管理员权限启动?"),
                     )
                     .child(
@@ -1173,6 +1285,7 @@ impl MainView {
                                 "elevate-ok",
                                 "确定",
                                 cx.listener(|this, _, _, cx| this.confirm_elevate(cx)),
+                                cx,
                             ))
                             .child(chip_label(
                                 "elevate-cancel",
@@ -1181,17 +1294,17 @@ impl MainView {
                                     this.show_elevate = false;
                                     cx.notify();
                                 }),
+                                cx,
                             )),
                     ),
             )
     }
 
     fn confirm_elevate(&mut self, cx: &mut Context<Self>) {
-        UiState {
-            mode: UiMode::Enhance,
-            node: self.saved_node(),
-        }
-        .save();
+        UiState::patch(|s| {
+            s.mode = UiMode::Enhance;
+            s.node = self.saved_node();
+        });
         self.show_elevate = false;
         cx.notify();
         let core = self.core.clone();
@@ -1267,12 +1380,12 @@ fn health_rank(n: &NodeVm) -> (u8, i32) {
     }
 }
 
-fn latency_color(health: HealthStatus) -> u32 {
+fn latency_color(health: HealthStatus, muted: u32) -> u32 {
     match health {
         HealthStatus::Ok => 0x16a34a,
         HealthStatus::Slow => 0xca8a04,
         HealthStatus::LatencyFailed => 0xdc2626,
-        _ => UI_MUTED,
+        _ => muted,
     }
 }
 
@@ -1298,7 +1411,8 @@ fn find_saved_node(nodes: &[NodeVm], want: &SavedNode) -> Option<usize> {
         })
 }
 
-fn title_bar(maximized: bool) -> impl IntoElement {
+fn title_bar(maximized: bool, cx: &App) -> impl IntoElement {
+    let p = theme::current(cx);
     div()
         .id("title-bar")
         .h(px(TITLE_BAR_H))
@@ -1306,10 +1420,10 @@ fn title_bar(maximized: bool) -> impl IntoElement {
         .flex()
         .flex_row()
         .items_center()
-        .bg(rgb(UI_CHIP))
+        .bg(rgb(p.chip))
         .border_b_1()
-        .border_color(rgb(UI_BORDER))
-        .text_color(rgb(UI_FG))
+        .border_color(rgb(p.border))
+        .text_color(rgb(p.fg))
         .child(
             div()
                 .id("title-drag")
@@ -1321,14 +1435,15 @@ fn title_bar(maximized: bool) -> impl IntoElement {
                 .window_control_area(WindowControlArea::Drag)
                 .child("rust-clash"),
         )
-        .child(win_ctrl("win-min", "─", WindowControlArea::Min, false))
+        .child(win_ctrl("win-min", "─", WindowControlArea::Min, false, cx))
         .child(win_ctrl(
             "win-max",
             if maximized { "❐" } else { "□" },
             WindowControlArea::Max,
             false,
+            cx,
         ))
-        .child(win_ctrl("win-close", "×", WindowControlArea::Close, true))
+        .child(win_ctrl("win-close", "×", WindowControlArea::Close, true, cx))
 }
 
 fn win_ctrl(
@@ -1336,7 +1451,9 @@ fn win_ctrl(
     label: &'static str,
     area: WindowControlArea,
     close: bool,
+    cx: &App,
 ) -> impl IntoElement {
+    let p = theme::current(cx);
     div()
         .id(id)
         .w(px(46.))
@@ -1344,13 +1461,13 @@ fn win_ctrl(
         .flex()
         .items_center()
         .justify_center()
-        .text_color(rgb(UI_FG))
+        .text_color(rgb(p.fg))
         .window_control_area(area)
         .hover(move |s| {
             if close {
                 s.bg(rgb(0xdc2626)).text_color(rgb(0xffffff))
             } else {
-                s.bg(rgb(UI_CHIP_HOVER))
+                s.bg(rgb(p.chip_hover))
             }
         })
         .child(label)
@@ -1359,17 +1476,19 @@ fn win_ctrl(
 fn chip(
     label: &'static str,
     on: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &App,
 ) -> impl IntoElement {
+    let p = theme::current(cx);
     div()
         .id(label)
         .flex_none()
         .px_2()
         .py_1()
         .rounded_md()
-        .bg(rgb(UI_CHIP))
-        .text_color(rgb(UI_FG))
+        .bg(rgb(p.chip))
+        .text_color(rgb(p.fg))
         .cursor_pointer()
-        .hover(|s| s.bg(rgb(UI_CHIP_HOVER)))
+        .hover(move |s| s.bg(rgb(p.chip_hover)))
         .on_click(on)
         .child(label)
 }
@@ -1378,28 +1497,31 @@ fn chip_label(
     id: &'static str,
     label: impl Into<SharedString>,
     on: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &App,
 ) -> impl IntoElement {
+    let p = theme::current(cx);
     div()
         .id(id)
         .flex_none()
         .px_2()
         .py_1()
         .rounded_md()
-        .bg(rgb(UI_CHIP))
-        .text_color(rgb(UI_FG))
+        .bg(rgb(p.chip))
+        .text_color(rgb(p.fg))
         .cursor_pointer()
-        .hover(|s| s.bg(rgb(UI_CHIP_HOVER)))
+        .hover(move |s| s.bg(rgb(p.chip_hover)))
         .on_click(on)
         .child(label.into())
 }
 
-fn toggle_knob(id: &'static str, on: bool) -> impl IntoElement {
+fn toggle_knob(id: &'static str, on: bool, cx: &App) -> impl IntoElement {
+    let p = theme::current(cx);
     div()
         .id(id)
         .w(px(36.))
         .h(px(20.))
         .rounded_full()
-        .bg(if on { rgb(0x22c55e) } else { rgb(0xa1a1aa) })
+        .bg(if on { rgb(p.success) } else { rgb(p.muted) })
         .flex()
         .items_center()
         .px(px(2.))
@@ -1551,8 +1673,9 @@ fn main() {
     let force_enhance = flags.start_enhance;
     Application::new().run(move |cx: &mut App| {
         let _ = gpui_component::init(cx);
-        Theme::change(ThemeMode::Light, None, cx);
-        Theme::global_mut(cx).font_size = px(13.);
+        theme::apply(saved.theme, None, cx);
+        cx.on_action(quit_action);
+        cx.bind_keys([KeyBinding::new("ctrl-q", Quit, None)]);
         let bounds = Bounds::centered(None, size(px(706.), px(494.)), cx);
         cx.open_window(
             WindowOptions {
@@ -1564,6 +1687,8 @@ fn main() {
                 }),
                 is_resizable: true,
                 window_min_size: Some(size(px(706.), px(494.))),
+                show: true,
+                focus: true,
                 ..Default::default()
             },
             move |window, cx| {
@@ -1580,4 +1705,18 @@ fn main() {
         proxy.stop().await;
         inbound::force_restore();
     });
+}
+
+fn request_quit(cx: &mut App) {
+    ALLOW_QUIT.store(true, Ordering::SeqCst);
+    cx.quit();
+}
+
+fn request_restart(cx: &mut App) {
+    ALLOW_QUIT.store(true, Ordering::SeqCst);
+    cx.restart();
+}
+
+fn quit_action(_: &Quit, cx: &mut App) {
+    request_quit(cx);
 }

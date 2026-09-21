@@ -20,12 +20,60 @@ pub struct SavedNode {
     pub port: u16,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UiTheme {
+    #[default]
+    LightModern,
+    OneDark,
+    Dracula,
+    CatppuccinMocha,
+    CatppuccinLatte,
+    GithubLight,
+}
+
+impl UiTheme {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OneDark => "One Dark",
+            Self::Dracula => "Dracula",
+            Self::CatppuccinMocha => "Catppuccin Mocha",
+            Self::LightModern => "Light Modern",
+            Self::CatppuccinLatte => "Catppuccin Latte",
+            Self::GithubLight => "GitHub Light",
+        }
+    }
+
+    pub fn is_dark(self) -> bool {
+        matches!(self, Self::OneDark | Self::Dracula | Self::CatppuccinMocha)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UiState {
     #[serde(default)]
     pub mode: UiMode,
     #[serde(default)]
     pub node: Option<SavedNode>,
+    #[serde(default = "default_true")]
+    pub window_visible: bool,
+    #[serde(default)]
+    pub theme: UiTheme,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for UiState {
+    fn default() -> Self {
+        Self {
+            mode: UiMode::Off,
+            node: None,
+            window_visible: true,
+            theme: UiTheme::LightModern,
+        }
+    }
 }
 
 /// Flags passed when relaunching elevated so TUN starts after UAC without
@@ -87,6 +135,12 @@ impl UiState {
             let _ = std::fs::write(path, text);
         }
     }
+
+    pub fn patch(f: impl FnOnce(&mut Self)) {
+        let mut s = Self::load();
+        f(&mut s);
+        s.save();
+    }
 }
 
 #[cfg(test)]
@@ -104,10 +158,33 @@ mod tests {
                 server: "example.com".into(),
                 port: 443,
             }),
+            window_visible: false,
+            theme: UiTheme::Dracula,
         };
         state.save_to(&path);
         let loaded = UiState::load_from(&path);
         assert_eq!(loaded, state);
+    }
+
+    #[test]
+    fn missing_window_visible_defaults_shown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ui-state.json");
+        std::fs::write(&path, r#"{"mode":"off"}"#).unwrap();
+        let loaded = UiState::load_from(&path);
+        assert!(loaded.window_visible);
+        assert_eq!(loaded.theme, UiTheme::LightModern);
+    }
+
+    #[test]
+    fn missing_theme_defaults_light_modern() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ui-state.json");
+        std::fs::write(&path, r#"{"mode":"proxy","window_visible":false}"#).unwrap();
+        let loaded = UiState::load_from(&path);
+        assert_eq!(loaded.theme, UiTheme::LightModern);
+        assert!(!loaded.window_visible);
+        assert_eq!(loaded.mode, UiMode::Proxy);
     }
 
     #[test]

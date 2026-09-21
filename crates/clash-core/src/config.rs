@@ -26,6 +26,40 @@ pub struct ProxyNode {
     pub ws_path: Option<String>,
     pub ws_host: Option<String>,
     pub security: Option<String>,
+    pub cipher: Option<String>,
+    pub username: Option<String>,
+    pub plugin: Option<String>,
+    pub plugin_opts: Option<String>,
+    pub alter_id: u16,
+}
+
+impl Default for ProxyNode {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            type_name: String::new(),
+            server: String::new(),
+            port: 0,
+            uuid: None,
+            password: None,
+            tls: false,
+            server_name: None,
+            flow: None,
+            network: "tcp".into(),
+            client_fingerprint: None,
+            reality_public_key: None,
+            reality_short_id: None,
+            skip_cert_verify: false,
+            ws_path: None,
+            ws_host: None,
+            security: None,
+            cipher: None,
+            username: None,
+            plugin: None,
+            plugin_opts: None,
+            alter_id: 0,
+        }
+    }
 }
 
 impl ProxyNode {
@@ -41,36 +75,51 @@ pub struct NodeFilter;
 
 impl NodeFilter {
     pub fn accept(node: &ProxyNode) -> bool {
-        let ty = node.type_name.trim().to_ascii_lowercase();
-        if ty != "vless" && ty != "trojan" {
-            return false;
-        }
+        let ty = normalize_type(&node.type_name);
         let mut network = node.network.trim().to_ascii_lowercase();
         if network == "websocket" {
             network = "ws".into();
         }
-        if matches!(network.as_str(), "grpc" | "xhttp" | "h2") {
+        if matches!(network.as_str(), "grpc" | "xhttp" | "h2" | "quic") {
             return false;
         }
-        if !matches!(network.as_str(), "tcp" | "ws" | "") {
+        if !matches!(network.as_str(), "tcp" | "ws" | "httpupgrade" | "raw" | "") {
             return false;
         }
-        if ty == "vless" {
-            let security = Self::resolve_security(node);
-            if !matches!(security.as_str(), "none" | "tls" | "reality") {
-                return false;
+        match ty.as_str() {
+            "vless" => {
+                let security = Self::resolve_security(node);
+                if !matches!(security.as_str(), "none" | "tls" | "reality") {
+                    return false;
+                }
+                let flow = node.flow.as_deref().unwrap_or("").trim();
+                if !flow.is_empty() && !flow.eq_ignore_ascii_case("xtls-rprx-vision") {
+                    return false;
+                }
+                !node.uuid.as_deref().unwrap_or("").trim().is_empty()
             }
-            let flow = node.flow.as_deref().unwrap_or("").trim();
-            if !flow.is_empty() && !flow.eq_ignore_ascii_case("xtls-rprx-vision") {
-                return false;
+            "trojan" => !node.password.as_deref().unwrap_or("").trim().is_empty(),
+            "ss" => {
+                if node.password.as_deref().unwrap_or("").trim().is_empty() {
+                    return false;
+                }
+                let method = node.cipher.as_deref().unwrap_or("aes-256-gcm").trim();
+                clash_proxynet::ss_supported_cipher(method) && Self::ss_plugin_ok(node)
             }
-            if node.uuid.as_deref().unwrap_or("").trim().is_empty() {
-                return false;
-            }
-        } else if node.password.as_deref().unwrap_or("").trim().is_empty() {
-            return false;
+            "vmess" => !node.uuid.as_deref().unwrap_or("").trim().is_empty(),
+            "socks5" | "http" => true,
+            _ => false,
         }
-        true
+    }
+
+    fn ss_plugin_ok(node: &ProxyNode) -> bool {
+        let plugin = node.plugin.as_deref().unwrap_or("").trim().to_ascii_lowercase();
+        plugin.is_empty()
+            || plugin == "none"
+            || matches!(
+                plugin.as_str(),
+                "obfs" | "obfs-local" | "simple-obfs" | "v2ray-plugin"
+            )
     }
 
     pub fn resolve_security(node: &ProxyNode) -> String {
@@ -530,64 +579,150 @@ pub fn load_proxies_yaml(text: &str) -> Vec<ProxyNode> {
     let entries = parse_proxies_section(&lines);
     let mut nodes = Vec::new();
     for p in entries {
-        let ty = p.get("type").unwrap_or("").trim().to_ascii_lowercase();
-        if ty != "vless" && ty != "trojan" {
-            continue;
+        if let Some(node) = yaml_to_node(&p) {
+            nodes.push(node);
         }
-        let network = p.get("network").unwrap_or("tcp").trim().to_ascii_lowercase();
-        let name = p.get("name");
-        let server = p.get("server");
-        let port: u16 = p.get("port").and_then(|s| s.parse().ok()).unwrap_or(0);
-        if name.is_none_or(|s| s.trim().is_empty())
-            || server.is_none_or(|s| s.trim().is_empty())
-            || port == 0
-        {
-            continue;
-        }
-        if ty == "vless" && p.get("uuid").is_none_or(|s| s.trim().is_empty()) {
-            continue;
-        }
-        if ty == "trojan" && p.get("password").is_none_or(|s| s.trim().is_empty()) {
-            continue;
-        }
-        let net = if network == "ws" || network == "websocket" {
-            "ws"
-        } else {
-            network.as_str()
-        };
-        let has_reality = p.get("reality-opts.public-key").is_some_and(|s| !s.is_empty());
-        let tls = parse_bool(p.get("tls")) || ty == "trojan" || has_reality;
-        let security = if has_reality {
-            "reality"
-        } else if tls {
-            "tls"
-        } else {
-            "none"
-        };
-        nodes.push(ProxyNode {
-            name: name.unwrap().to_string(),
-            type_name: ty,
-            server: server.unwrap().to_string(),
-            port,
-            uuid: p.get("uuid").map(|s| s.to_string()),
-            password: p.get("password").map(|s| s.to_string()),
-            tls,
-            server_name: p.get("servername").or_else(|| p.get("sni")).map(|s| s.to_string()),
-            flow: p.get("flow").map(|s| s.to_string()),
-            network: net.to_string(),
-            client_fingerprint: p.get("client-fingerprint").map(|s| s.to_string()),
-            reality_public_key: p.get("reality-opts.public-key").map(|s| s.to_string()),
-            reality_short_id: p.get("reality-opts.short-id").map(|s| s.to_string()),
-            skip_cert_verify: parse_bool(p.get("skip-cert-verify")),
-            ws_path: p.get("ws-opts.path").map(|s| s.to_string()),
-            ws_host: p
-                .get("ws-opts.headers.Host")
-                .or_else(|| p.get("ws-opts.headers.host"))
-                .map(|s| s.to_string()),
-            security: Some(security.into()),
-        });
     }
     nodes
+}
+
+fn yaml_to_node(p: &YamlMap) -> Option<ProxyNode> {
+    let ty = normalize_type(p.get("type").unwrap_or(""));
+    if !matches!(ty.as_str(), "vless" | "trojan" | "ss" | "vmess" | "socks5" | "http") {
+        return None;
+    }
+    let mut network = p.get("network").unwrap_or("tcp").trim().to_ascii_lowercase();
+    if network == "websocket" {
+        network = "ws".into();
+    }
+    let name = p.get("name")?;
+    let server = p.get("server")?;
+    let port: u16 = p.get("port").and_then(|s| s.parse().ok()).unwrap_or(0);
+    if name.trim().is_empty() || server.trim().is_empty() || port == 0 {
+        return None;
+    }
+    let has_reality = p.get("reality-opts.public-key").is_some_and(|s| !s.is_empty());
+    let mut tls = parse_bool(p.get("tls")) || ty == "trojan" || has_reality;
+    let security = if has_reality {
+        "reality"
+    } else if tls {
+        "tls"
+    } else {
+        "none"
+    };
+    let mut plugin = p.get("plugin").map(|s| s.to_string());
+    let mut plugin_opts = plugin_opts_from_yaml(p);
+    let mut ws_path = p
+        .get("ws-opts.path")
+        .or_else(|| p.get("http-opts.path"))
+        .map(|s| s.to_string());
+    let mut ws_host = p
+        .get("ws-opts.headers.Host")
+        .or_else(|| p.get("ws-opts.headers.host"))
+        .map(|s| s.to_string());
+    if plugin
+        .as_deref()
+        .is_some_and(|s| s.eq_ignore_ascii_case("v2ray-plugin"))
+    {
+        network = "ws".into();
+        tls = tls
+            || plugin_opts
+                .as_deref()
+                .is_some_and(|s| s.contains("tls=true") || s.contains("tls=1"));
+        if ws_path.is_none() {
+            ws_path = opt_from_plugin(plugin_opts.as_deref(), "path");
+        }
+        if ws_host.is_none() {
+            ws_host = opt_from_plugin(plugin_opts.as_deref(), "host");
+        }
+        plugin = None;
+        plugin_opts = None;
+    }
+    Some(ProxyNode {
+        name: name.to_string(),
+        type_name: ty,
+        server: server.to_string(),
+        port,
+        uuid: p.get("uuid").or_else(|| p.get("id")).map(|s| s.to_string()),
+        password: p.get("password").map(|s| s.to_string()),
+        tls,
+        server_name: p.get("servername").or_else(|| p.get("sni")).map(|s| s.to_string()),
+        flow: p.get("flow").map(|s| s.to_string()),
+        network,
+        client_fingerprint: p.get("client-fingerprint").map(|s| s.to_string()),
+        reality_public_key: p.get("reality-opts.public-key").map(|s| s.to_string()),
+        reality_short_id: p.get("reality-opts.short-id").map(|s| s.to_string()),
+        skip_cert_verify: parse_bool(p.get("skip-cert-verify")),
+        ws_path,
+        ws_host,
+        security: Some(security.into()),
+        cipher: p
+            .get("cipher")
+            .or_else(|| p.get("method"))
+            .map(|s| s.to_string()),
+        username: p.get("username").map(|s| s.to_string()),
+        plugin,
+        plugin_opts,
+        alter_id: p
+            .get("alterId")
+            .or_else(|| p.get("alter-id"))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0),
+    })
+}
+
+fn plugin_opts_from_yaml(p: &YamlMap) -> Option<String> {
+    if let Some(raw) = p.get("plugin-opts") {
+        if !raw.is_empty() && !raw.starts_with('{') {
+            return Some(raw.to_string());
+        }
+    }
+    let mut parts = Vec::new();
+    for key in [
+        "plugin-opts.mode",
+        "plugin-opts.obfs",
+        "plugin-opts.host",
+        "plugin-opts.obfs-host",
+        "plugin-opts.path",
+        "plugin-opts.tls",
+        "plugin-opts.mux",
+    ] {
+        if let Some(v) = p.get(key) {
+            let short = key.trim_start_matches("plugin-opts.");
+            let mapped = match short {
+                "mode" => "obfs",
+                "host" => "obfs-host",
+                other => other,
+            };
+            parts.push(format!("{mapped}={v}"));
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(";"))
+    }
+}
+
+fn opt_from_plugin(opts: Option<&str>, key: &str) -> Option<String> {
+    let opts = opts?;
+    for part in opts.split([';', '&']) {
+        if let Some((k, v)) = part.split_once('=') {
+            if k.eq_ignore_ascii_case(key) {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn normalize_type(ty: &str) -> String {
+    match ty.trim().to_ascii_lowercase().as_str() {
+        "shadowsocks" | "ss" => "ss".into(),
+        "socks" | "socks5" => "socks5".into(),
+        "https" => "http".into(),
+        other => other.to_string(),
+    }
 }
 
 fn parse_bool(s: Option<&str>) -> bool {
@@ -789,6 +924,22 @@ pub fn parse_share_link(line: &str) -> Option<ProxyNode> {
     if line.to_ascii_lowercase().starts_with("trojan://") {
         return parse_trojan(line);
     }
+    if line.to_ascii_lowercase().starts_with("ss://") {
+        return parse_ss(line);
+    }
+    if line.to_ascii_lowercase().starts_with("vmess://") {
+        return parse_vmess(line);
+    }
+    if line.to_ascii_lowercase().starts_with("socks5://")
+        || line.to_ascii_lowercase().starts_with("socks://")
+    {
+        return parse_socks_link(line);
+    }
+    if line.to_ascii_lowercase().starts_with("http://")
+        || line.to_ascii_lowercase().starts_with("https://")
+    {
+        return parse_http_link(line);
+    }
     None
 }
 
@@ -862,6 +1013,7 @@ fn parse_vless(url: &str) -> Option<ProxyNode> {
         ws_path: qs.get("path").cloned(),
         ws_host: qs.get("host").cloned(),
         security: Some(security),
+        ..Default::default()
     })
 }
 
@@ -910,6 +1062,187 @@ fn parse_trojan(url: &str) -> Option<ProxyNode> {
         ws_path: qs.get("path").cloned(),
         ws_host: qs.get("host").cloned(),
         security: Some(security),
+        ..Default::default()
+    })
+}
+
+fn parse_ss(url: &str) -> Option<ProxyNode> {
+    let hash = url.find('#').map(|i| url_decode(&url[i + 1..]));
+    let rest = url.split('#').next().unwrap_or(url);
+    let body = rest
+        .trim_start_matches("ss://")
+        .trim_start_matches("SS://");
+    let (userinfo, hostport, plugin) = if let Some(at) = body.rfind('@') {
+        let (left, right) = body.split_at(at);
+        let right = &right[1..];
+        let (hp, q) = right.split_once('?').unwrap_or((right, ""));
+        (decode_ss_userinfo(left)?, hp.to_string(), q.to_string())
+    } else {
+        let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        let decoded = decode_b64_url(&compact)?;
+        let (left, right) = decoded.split_once('@')?;
+        (left.to_string(), right.to_string(), String::new())
+    };
+    let (method, password) = userinfo.split_once(':')?;
+    let (host, port) = split_host_port_str(&hostport)?;
+    let qs = parse_query(&plugin);
+    let mut plugin_name = qs.get("plugin").cloned();
+    let mut plugin_opts = None;
+    if let Some(p) = plugin_name.clone() {
+        if let Some((name, opts)) = p.split_once(';') {
+            plugin_name = Some(name.to_string());
+            plugin_opts = Some(opts.to_string());
+        } else {
+            plugin_opts = qs
+                .iter()
+                .filter(|(k, _)| *k != "plugin")
+                .map(|(k, v)| format!("{k}={v}"))
+                .reduce(|a, b| format!("{a};{b}"));
+        }
+    }
+    Some(ProxyNode {
+        name: hash.filter(|s| !s.is_empty()).unwrap_or_else(|| host.clone()),
+        type_name: "ss".into(),
+        server: host,
+        port,
+        password: Some(password.to_string()),
+        cipher: Some(method.to_string()),
+        plugin: plugin_name,
+        plugin_opts,
+        ..Default::default()
+    })
+}
+
+fn decode_ss_userinfo(left: &str) -> Option<String> {
+    if left.contains(':') {
+        return Some(url_decode(left));
+    }
+    decode_b64_url(left)
+}
+
+fn decode_b64_url(s: &str) -> Option<String> {
+    let pad = |s: &str| {
+        let m = s.len() % 4;
+        if m == 0 {
+            s.to_string()
+        } else {
+            format!("{s}{}", "=".repeat(4 - m))
+        }
+    };
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(pad(s))
+        .or_else(|_| {
+            let alt = s.replace('-', "+").replace('_', "/");
+            base64::engine::general_purpose::STANDARD.decode(pad(&alt))
+        })
+        .ok()?;
+    String::from_utf8(bytes).ok()
+}
+
+fn split_host_port_str(s: &str) -> Option<(String, u16)> {
+    let s = s.trim();
+    if let Some(rest) = s.strip_prefix('[') {
+        let (host, rest) = rest.split_once(']')?;
+        let port = rest.trim_start_matches(':').parse().ok()?;
+        return Some((host.to_string(), port));
+    }
+    let (host, port) = s.rsplit_once(':')?;
+    Some((host.to_string(), port.parse().ok()?))
+}
+
+fn parse_vmess(url: &str) -> Option<ProxyNode> {
+    let body = url
+        .trim_start_matches("vmess://")
+        .trim_start_matches("VMESS://");
+    let json = decode_b64_url(body)?;
+    let v: serde_json::Value = serde_json::from_str(&json).ok()?;
+    let server = v.get("add")?.as_str()?.to_string();
+    let port = v
+        .get("port")
+        .and_then(|p| p.as_u64().or_else(|| p.as_str().and_then(|s| s.parse().ok())))
+        .unwrap_or(0) as u16;
+    if server.is_empty() || port == 0 {
+        return None;
+    }
+    let tls = v
+        .get("tls")
+        .and_then(|t| t.as_str())
+        .is_some_and(|s| !s.is_empty() && !s.eq_ignore_ascii_case("none"));
+    let mut network = v
+        .get("net")
+        .and_then(|n| n.as_str())
+        .unwrap_or("tcp")
+        .to_ascii_lowercase();
+    if network == "websocket" {
+        network = "ws".into();
+    }
+    Some(ProxyNode {
+        name: v
+            .get("ps")
+            .and_then(|p| p.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(server.as_str())
+            .to_string(),
+        type_name: "vmess".into(),
+        server,
+        port,
+        uuid: v.get("id").and_then(|i| i.as_str()).map(|s| s.to_string()),
+        tls,
+        server_name: v.get("sni").and_then(|s| s.as_str()).map(|s| s.to_string()),
+        network,
+        ws_path: v.get("path").and_then(|p| p.as_str()).map(|s| s.to_string()),
+        ws_host: v.get("host").and_then(|h| h.as_str()).map(|s| s.to_string()),
+        security: Some(if tls { "tls".into() } else { "none".into() }),
+        cipher: v.get("scy").and_then(|s| s.as_str()).map(|s| s.to_string()),
+        alter_id: v
+            .get("aid")
+            .and_then(|a| a.as_u64().or_else(|| a.as_str().and_then(|s| s.parse().ok())))
+            .unwrap_or(0) as u16,
+        ..Default::default()
+    })
+}
+
+fn parse_socks_link(url: &str) -> Option<ProxyNode> {
+    let uri = url::Url::parse(url).ok()?;
+    let host = uri.host_str()?.to_string();
+    let port = uri.port().unwrap_or(1080);
+    let user = url_decode(uri.username());
+    Some(ProxyNode {
+        name: uri
+            .fragment()
+            .map(url_decode)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| host.clone()),
+        type_name: "socks5".into(),
+        server: host,
+        port,
+        username: if user.is_empty() { None } else { Some(user) },
+        password: uri.password().map(url_decode),
+        ..Default::default()
+    })
+}
+
+fn parse_http_link(url: &str) -> Option<ProxyNode> {
+    let uri = url::Url::parse(url).ok()?;
+    if uri.path() != "/" && !uri.path().is_empty() {
+        return None;
+    }
+    let host = uri.host_str()?.to_string();
+    let port = uri.port().unwrap_or(if uri.scheme() == "https" { 443 } else { 80 });
+    let user = url_decode(uri.username());
+    Some(ProxyNode {
+        name: uri
+            .fragment()
+            .map(url_decode)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| host.clone()),
+        type_name: "http".into(),
+        server: host,
+        port,
+        username: if user.is_empty() { None } else { Some(user) },
+        password: uri.password().map(url_decode),
+        tls: uri.scheme() == "https",
+        ..Default::default()
     })
 }
 
@@ -970,13 +1303,38 @@ fn filter_all(nodes: Vec<ProxyNode>) -> Vec<ProxyNode> {
         .into_iter()
         .filter(NodeFilter::accept)
         .map(normalize_network)
+        .map(normalize_ss_plugin)
         .collect()
+}
+
+fn normalize_ss_plugin(mut n: ProxyNode) -> ProxyNode {
+    let plugin = n.plugin.as_deref().unwrap_or("").to_ascii_lowercase();
+    if plugin != "v2ray-plugin" {
+        return n;
+    }
+    n.network = "ws".into();
+    if opt_from_plugin(n.plugin_opts.as_deref(), "tls").is_some_and(|v| v == "true" || v == "1") {
+        n.tls = true;
+    }
+    if n.ws_path.is_none() {
+        n.ws_path = opt_from_plugin(n.plugin_opts.as_deref(), "path");
+    }
+    if n.ws_host.is_none() {
+        n.ws_host = opt_from_plugin(n.plugin_opts.as_deref(), "host").or_else(|| opt_from_plugin(n.plugin_opts.as_deref(), "obfs-host"));
+    }
+    n.plugin = None;
+    n.plugin_opts = None;
+    n
 }
 
 fn normalize_network(mut n: ProxyNode) -> ProxyNode {
     let mut net = n.network.trim().to_ascii_lowercase();
     if net == "websocket" {
         net = "ws".into();
+    }
+    if net == "httpupgrade" {
+        n.network = "httpupgrade".into();
+        return n;
     }
     if net != "ws" {
         net = "tcp".into();
@@ -1060,7 +1418,7 @@ fn try_parse_json(text: &str) -> Vec<ProxyNode> {
     };
     let Some(obs) = v.get("outbounds").and_then(|o| o.as_array()) else {
         if v.get("servers").and_then(|s| s.as_array()).is_some() {
-            return Vec::new();
+            return filter_all(parse_sip008(&v));
         }
         return Vec::new();
     };
@@ -1089,13 +1447,13 @@ fn jint(v: &serde_json::Value, k: &str) -> i64 {
 }
 
 fn map_xray(ob: &serde_json::Value) -> Option<ProxyNode> {
-    let protocol = jstr(ob, "protocol")?.to_ascii_lowercase();
-    if protocol != "vless" && protocol != "trojan" {
+    let protocol = normalize_type(&jstr(ob, "protocol")?);
+    if !matches!(protocol.as_str(), "vless" | "trojan" | "ss" | "vmess" | "socks5" | "http") {
         return None;
     }
     let settings = ob.get("settings")?;
     let tag = jstr(ob, "tag");
-    let (server, port, uuid, password, flow) = if protocol == "vless" {
+    let (server, port, uuid, password, flow, cipher, alter_id, username) = if protocol == "vless" || protocol == "vmess" {
         let v = settings.get("vnext")?.as_array()?.first()?;
         let server = jstr(v, "address")?;
         let port = jint(v, "port") as u16;
@@ -1106,6 +1464,34 @@ fn map_xray(ob: &serde_json::Value) -> Option<ProxyNode> {
             jstr(u, "id"),
             None,
             jstr(u, "flow"),
+            jstr(u, "security").or_else(|| jstr(u, "encryption")),
+            u.get("alterId").and_then(|x| x.as_u64()).unwrap_or(0) as u16,
+            None,
+        )
+    } else if protocol == "ss" {
+        let s = settings.get("servers").and_then(|a| a.as_array()).and_then(|a| a.first()).unwrap_or(settings);
+        (
+            jstr(s, "address")?,
+            jint(s, "port") as u16,
+            None,
+            jstr(s, "password"),
+            None,
+            jstr(s, "method"),
+            0,
+            None,
+        )
+    } else if protocol == "socks5" || protocol == "http" {
+        let s = settings.get("servers").and_then(|a| a.as_array()).and_then(|a| a.first()).unwrap_or(settings);
+        let users = s.get("users").and_then(|a| a.as_array()).and_then(|a| a.first());
+        (
+            jstr(s, "address")?,
+            jint(s, "port") as u16,
+            None,
+            users.and_then(|u| jstr(u, "pass")).or_else(|| jstr(s, "password")),
+            None,
+            None,
+            0,
+            users.and_then(|u| jstr(u, "user")).or_else(|| jstr(s, "user")),
         )
     } else {
         let s = settings.get("servers")?.as_array()?.first()?;
@@ -1114,6 +1500,9 @@ fn map_xray(ob: &serde_json::Value) -> Option<ProxyNode> {
             jint(s, "port") as u16,
             None,
             jstr(s, "password"),
+            None,
+            None,
+            0,
             None,
         )
     };
@@ -1172,12 +1561,16 @@ fn map_xray(ob: &serde_json::Value) -> Option<ProxyNode> {
         ws_path,
         ws_host,
         security: Some(security),
+        cipher,
+        username,
+        alter_id,
+        ..Default::default()
     })
 }
 
 fn map_singbox(ob: &serde_json::Value) -> Option<ProxyNode> {
-    let ty = jstr(ob, "type")?.to_ascii_lowercase();
-    if ty != "vless" && ty != "trojan" {
+    let ty = normalize_type(&jstr(ob, "type")?);
+    if !matches!(ty.as_str(), "vless" | "trojan" | "ss" | "vmess" | "socks5" | "http") {
         return None;
     }
     let server = jstr(ob, "server")?;
@@ -1240,7 +1633,40 @@ fn map_singbox(ob: &serde_json::Value) -> Option<ProxyNode> {
         ws_path,
         ws_host,
         security: Some(security),
+        cipher: jstr(ob, "method").or_else(|| jstr(ob, "cipher")),
+        username: jstr(ob, "username"),
+        alter_id: ob.get("alter_id").and_then(|x| x.as_u64()).unwrap_or(0) as u16,
+        plugin: jstr(ob, "plugin"),
+        plugin_opts: jstr(ob, "plugin_opts"),
+        ..Default::default()
     })
+}
+
+fn parse_sip008(v: &serde_json::Value) -> Vec<ProxyNode> {
+    let Some(servers) = v.get("servers").and_then(|s| s.as_array()) else {
+        return Vec::new();
+    };
+    let mut nodes = Vec::new();
+    for s in servers {
+        let Some(server) = jstr(s, "server") else { continue };
+        let port = jint(s, "server_port") as u16;
+        let Some(password) = jstr(s, "password") else { continue };
+        if server.is_empty() || port == 0 {
+            continue;
+        }
+        nodes.push(ProxyNode {
+            name: jstr(s, "remarks").filter(|n| !n.is_empty()).unwrap_or_else(|| server.clone()),
+            type_name: "ss".into(),
+            server,
+            port,
+            password: Some(password),
+            cipher: jstr(s, "method"),
+            plugin: jstr(s, "plugin"),
+            plugin_opts: jstr(s, "plugin_opts"),
+            ..Default::default()
+        });
+    }
+    nodes
 }
 
 // ---- subscription client ----

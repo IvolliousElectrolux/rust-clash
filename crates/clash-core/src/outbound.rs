@@ -5,7 +5,10 @@ use std::time::Duration;
 
 use parking_lot::RwLock;
 
-use clash_proxynet::{TrojanOptions, VlessOptions, VlessSecurity, dial};
+use clash_proxynet::{
+    HttpProxyOptions, OutboundKind, SocksOptions, SsOptions, TrojanOptions, VlessOptions,
+    VlessSecurity, VmessOptions, dial,
+};
 
 use crate::config::ProxyNode;
 use crate::dns::DohResolver;
@@ -55,37 +58,27 @@ impl OutboundDialer {
         host: &str,
         port: u16,
     ) -> anyhow::Result<clash_proxynet::BoxedStream> {
-        let dial_host = self.resolve_node_host(&node.server).await?;
-        let ip: IpAddr = dial_host
-            .parse()
-            .map_err(|_| anyhow::anyhow!("node host is not an IP"))?;
-        let tcp = tokio::time::timeout(
-            Duration::from_secs(8),
-            InterfaceBinder::connect(std::net::SocketAddr::new(ip, node.port)),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("tcp connect timeout"))??;
+        let ips = self.resolve_host(&node.server).await?;
+        self.dial_via_ips(node, &ips, host, port).await
+    }
+
+    pub async fn dial_via_ips(
+        &self,
+        node: &ProxyNode,
+        ips: &[IpAddr],
+        host: &str,
+        port: u16,
+    ) -> anyhow::Result<clash_proxynet::BoxedStream> {
+        let tcp = InterfaceBinder::connect_happy(ips, node.port, Duration::from_secs(8)).await?;
+        let dial_host = ips
+            .iter()
+            .find(|i| i.is_ipv4())
+            .or_else(|| ips.first())
+            .ok_or_else(|| anyhow::anyhow!("DoH no A record for node {}", node.server))?
+            .to_string();
         let ty = node.type_name.to_ascii_lowercase();
-        let vless = if ty == "vless" {
-            Some(to_vless(node, &dial_host))
-        } else {
-            None
-        };
-        let trojan = if ty == "trojan" {
-            Some(to_trojan(node, &dial_host))
-        } else {
-            None
-        };
-        Ok(dial(
-            &ty,
-            tcp,
-            vless.as_ref(),
-            trojan.as_ref(),
-            host,
-            port,
-            Duration::from_secs(15),
-        )
-        .await?)
+        let kind = to_kind(node, &dial_host, &ty)?;
+        Ok(dial(&kind, tcp, host, port, Duration::from_secs(15)).await?)
     }
 
     pub async fn resolve_host(&self, host: &str) -> anyhow::Result<Vec<IpAddr>> {
@@ -105,21 +98,24 @@ impl OutboundDialer {
             .and_then(|ips| ips.into_iter().find(|i| i.is_ipv4()))
     }
 
-    async fn resolve_node_host(&self, server: &str) -> anyhow::Result<String> {
-        let ips = self.resolve_host(server).await?;
-        let ip = ips
-            .iter()
-            .find(|i| i.is_ipv4())
-            .ok_or_else(|| anyhow::anyhow!("DoH no A record for node {server}"))?;
-        Ok(ip.to_string())
-    }
-
     pub async fn resolve_node_ipv4(&self, node: Option<&ProxyNode>) -> Option<IpAddr> {
         let node = node?;
         if node.is_subscription_info() {
             return None;
         }
         self.resolve_host_ipv4(&node.server).await
+    }
+}
+
+fn to_kind(node: &ProxyNode, dial_host: &str, ty: &str) -> anyhow::Result<OutboundKind> {
+    match ty {
+        "vless" => Ok(OutboundKind::Vless(to_vless(node, dial_host))),
+        "trojan" => Ok(OutboundKind::Trojan(to_trojan(node, dial_host))),
+        "ss" | "shadowsocks" => Ok(OutboundKind::Shadowsocks(to_ss(node, dial_host))),
+        "vmess" => Ok(OutboundKind::Vmess(to_vmess(node, dial_host))),
+        "socks" | "socks5" => Ok(OutboundKind::Socks5(to_socks(node))),
+        "http" | "https" => Ok(OutboundKind::Http(to_http(node))),
+        other => Err(anyhow::anyhow!("unsupported outbound type {other}")),
     }
 }
 
@@ -171,6 +167,71 @@ fn to_trojan(node: &ProxyNode, dial_host: &str) -> TrojanOptions {
     }
 }
 
+fn net(node: &ProxyNode) -> String {
+    if node.network.is_empty() {
+        "tcp".into()
+    } else {
+        node.network.clone()
+    }
+}
+
+fn to_ss(node: &ProxyNode, dial_host: &str) -> SsOptions {
+    SsOptions {
+        method: node
+            .cipher
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "aes-256-gcm".into()),
+        password: node.password.clone().unwrap_or_default(),
+        host: dial_host.to_string(),
+        port: node.port,
+        plugin: node.plugin.clone(),
+        plugin_opts: node.plugin_opts.clone(),
+        transport: net(node),
+        path: node.ws_path.clone(),
+        host_header: node.ws_host.clone(),
+        sni: node.server_name.clone(),
+        alpn: Vec::new(),
+        allow_insecure: node.skip_cert_verify,
+        tls: node.tls,
+    }
+}
+
+fn to_vmess(node: &ProxyNode, dial_host: &str) -> VmessOptions {
+    VmessOptions {
+        id: node.uuid.clone().unwrap_or_default(),
+        security: node
+            .cipher
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "auto".into()),
+        alter_id: node.alter_id,
+        host: dial_host.to_string(),
+        port: node.port,
+        transport: net(node),
+        path: node.ws_path.clone(),
+        host_header: node.ws_host.clone(),
+        sni: node.server_name.clone(),
+        alpn: Vec::new(),
+        allow_insecure: node.skip_cert_verify,
+        tls: node.tls,
+    }
+}
+
+fn to_socks(node: &ProxyNode) -> SocksOptions {
+    SocksOptions {
+        username: node.username.clone(),
+        password: node.password.clone(),
+    }
+}
+
+fn to_http(node: &ProxyNode) -> HttpProxyOptions {
+    HttpProxyOptions {
+        username: node.username.clone(),
+        password: node.password.clone(),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HealthStatus {
     Idle,
@@ -201,25 +262,22 @@ impl HealthChecker {
     }
 
     pub async fn check(&self, node: &ProxyNode) -> HealthCheckResult {
-        let start = std::time::Instant::now();
-        let r = tokio::time::timeout(
-            Duration::from_millis(Self::TIMEOUT_MS),
-            self.probe(node),
-        )
-        .await;
-        match r {
-            Ok(Ok(true)) => {
-                let ms = start.elapsed().as_millis() as i32;
-                HealthCheckResult {
-                    latency_ok: true,
-                    latency_ms: Some(ms),
-                    status: if ms >= Self::SLOW_MS {
-                        HealthStatus::Slow
-                    } else {
-                        HealthStatus::Ok
-                    },
-                }
-            }
+        let work = async {
+            let ips = self.dialer.resolve_host(&node.server).await?;
+            let start = std::time::Instant::now();
+            let ok = self.probe_resolved(node, &ips).await?;
+            Ok::<_, anyhow::Error>((ok, start.elapsed().as_millis() as i32))
+        };
+        match tokio::time::timeout(Duration::from_millis(Self::TIMEOUT_MS), work).await {
+            Ok(Ok((true, ms))) => HealthCheckResult {
+                latency_ok: true,
+                latency_ms: Some(ms),
+                status: if ms >= Self::SLOW_MS {
+                    HealthStatus::Slow
+                } else {
+                    HealthStatus::Ok
+                },
+            },
             _ => HealthCheckResult {
                 latency_ok: false,
                 latency_ms: None,
@@ -228,20 +286,34 @@ impl HealthChecker {
         }
     }
 
-    async fn probe(&self, node: &ProxyNode) -> anyhow::Result<bool> {
-        let mut stream = self.dialer.dial_via(node, "www.google.com", 80).await?;
+    async fn probe_resolved(&self, node: &ProxyNode, ips: &[IpAddr]) -> anyhow::Result<bool> {
+        let mut stream = self
+            .dialer
+            .dial_via_ips(node, ips, "www.gstatic.com", 80)
+            .await?;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         stream
-            .write_all(b"GET /generate_204 HTTP/1.1\r\nHost: www.google.com\r\nConnection: close\r\nUser-Agent: NanoClash\r\n\r\n")
+            .write_all(b"GET /generate_204 HTTP/1.1\r\nHost: www.gstatic.com\r\nConnection: close\r\nUser-Agent: rust-clash\r\n\r\n")
             .await?;
         stream.flush().await?;
         let mut buf = [0u8; 512];
-        let n = stream.read(&mut buf).await.unwrap_or(0);
-        if n == 0 {
+        let mut total = 0usize;
+        while total < buf.len() {
+            let n = stream.read(&mut buf[total..]).await.unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            total += n;
+            if buf[..total].windows(2).any(|w| w == b"\r\n") {
+                break;
+            }
+        }
+        if total == 0 {
             return Ok(false);
         }
-        let head = String::from_utf8_lossy(&buf[..n]);
-        Ok(head.lines().next().unwrap_or("")            .contains(" 204"))
+        let head = String::from_utf8_lossy(&buf[..total]);
+        let status = head.split("\r\n").next().unwrap_or("");
+        Ok(status.contains(" 204"))
     }
 
     pub async fn check_all(
