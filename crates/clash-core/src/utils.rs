@@ -6,6 +6,7 @@ use parking_lot::Mutex;
 
 /// Spawn a helper process without flashing a console window on Windows.
 pub fn hidden_command(program: impl AsRef<OsStr>) -> std::process::Command {
+    #[allow(unused_mut)]
     let mut cmd = std::process::Command::new(program);
     #[cfg(windows)]
     {

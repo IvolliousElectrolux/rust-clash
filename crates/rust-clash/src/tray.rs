@@ -3,6 +3,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
+#[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Clone, Debug)]
 pub enum TrayEvent {
     ToggleWindow,
@@ -18,6 +19,7 @@ pub enum TrayEvent {
     Quit,
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Clone, Debug, Default)]
 pub struct TrayMenuState {
     pub proxy_on: bool,
@@ -34,6 +36,7 @@ pub struct Tray {
 
 struct Inner {
     menu: Mutex<TrayMenuState>,
+    #[allow(dead_code)]
     events: UnboundedSender<TrayEvent>,
 }
 
@@ -345,6 +348,7 @@ mod win {
     }
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn hwnd_from_window(window: &gpui::Window) -> Option<isize> {
     #[cfg(windows)]
     {

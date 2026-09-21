@@ -21,6 +21,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Linux GUI libs
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libxcb-xkb-dev \
+            libxcb-xfixes0-dev \
+            libwayland-dev
       - name: Test libraries
         run: cargo test -p clash-core -p clash-proxynet -p clash-tun
       - name: Release
