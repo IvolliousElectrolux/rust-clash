@@ -48,6 +48,7 @@ VLESS / Trojan / REALITY / Vision 是本仓库里已有的 outbound 实现, 不�
 
 ```
 cargo build --release -p rust-clash
+upx --best --lzma -f target\release\rust-clash.exe
 ```
 
 Windows 需要 `res/` 下的 `Rules.bin.gz`, `icon/icon.ico`, `wintun/wintun.dll`.

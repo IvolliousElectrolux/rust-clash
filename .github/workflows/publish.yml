@@ -32,10 +32,32 @@ jobs:
             libxcb-xkb-dev \
             libxcb-xfixes0-dev \
             libwayland-dev
+      - name: Install UPX
+        uses: crazy-max/ghaction-upx@v3
+        with:
+          version: latest
+          install-only: true
       - name: Test libraries
         run: cargo test -p clash-core -p clash-proxynet -p clash-tun
       - name: Release
         run: cargo build --release -p rust-clash
+      - name: UPX (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          where upx
+          upx -V
+          upx --best --lzma -f -q target\release\rust-clash.exe
+      - name: UPX (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v upx
+          upx -V
+          if [[ -f target/release/rust-clash ]]; then
+            upx --best --lzma -f -q target/release/rust-clash || echo "upx failed, keeping uncompressed"
+          fi
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
