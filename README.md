@@ -15,7 +15,7 @@ rust-clash 是 **霜龙** 所写 [NanoClash](https://github.com/ArrowMeo2088/Nan
 兼容性 (可与 NanoClash 共用同一份用户数据, 不要两个进程同时开):
 
 - 用户目录: `%AppData%\ArrorMeo\NanoClash` (`config.yaml`, 订阅缓存, `Rules.bin`, 撤销文件)
-- HTTP 入站: `127.0.0.1:7887`
+- HTTP 入站: `127.0.0.1:7890`
 - TUN 适配器名: `NanoClash`
 - 订阅与节点过滤、系统代理 / 增强模式互斥, 以及退出或崩溃后的代理 / 路由还原, 都按 NanoClash 的行为对齐
 
@@ -36,7 +36,7 @@ VLESS / Trojan / REALITY / Vision 是本仓库里已有的 outbound 实现, 不�
 
 ## 功能
 
-- 入站 HTTP `127.0.0.1:7887`; 代理模式才改系统代理, 退出或崩溃会还原
+- 入站 HTTP `127.0.0.1:7890`; 代理模式才改系统代理, 退出或崩溃会还原
 - 增强模式: Windows + 管理员, 与代理模式互斥
 - 出站: VLESS (none/tls/reality + Vision), Trojan TLS, Shadowsocks AEAD, VMess, SOCKS5, HTTP CONNECT; 传输 tcp / ws / httpupgrade, 以及 simple-obfs
 - 托盘常驻, 叉掉窗口是隐藏; 主题 (托盘右键, 不进主窗口)

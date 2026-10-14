@@ -1652,9 +1652,9 @@ fn main() {
     if let Some(e) = listen_err {
         let _ = std::fs::write(
             clash_core::AppPaths::user_data_dir().join("panic.log"),
-            format!("listen :7887: {e}\n"),
+            format!("listen :{}: {e}\n", clash_core::INBOUND_PORT),
         );
-        eprintln!("listen :7887: {e}");
+        eprintln!("listen :{}: {e}", clash_core::INBOUND_PORT);
     }
     let tun = Arc::new(TunService::new());
     tun.configure(rules, outbound.clone());

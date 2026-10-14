@@ -27,5 +27,5 @@ pub use ui_state::{LaunchFlags, SavedNode, UiMode, UiState, UiTheme};
 pub use rules::{action_for_ip, join_host_port, try_split_host_port, with_port, RuleAction, RuleDb};
 pub use utils::hidden_command;
 
-pub const INBOUND_PORT: u16 = 7887;
+pub const INBOUND_PORT: u16 = 7890;
 pub const RULES_GZ: &[u8] = include_bytes!("../../../res/Rules.bin.gz");

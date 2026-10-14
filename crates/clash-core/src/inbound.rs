@@ -57,7 +57,7 @@ impl ProxyService {
         TrafficCounters::snapshot_total_kbps()
     }
 
-    /// Cancel in-flight tunnels without dropping the :7887 listener.
+    /// Cancel in-flight tunnels without dropping the :7890 listener.
     pub fn abort_active(&self) {
         let mut g = self.conn.lock();
         g.cancel();
@@ -1271,7 +1271,7 @@ mod sysproxy {
             }
 
             #[test]
-            fn set_enabled_writes_7887() {
+            fn set_enabled_writes_inbound_port() {
                 let prev_en = read_dword("ProxyEnable");
                 let prev_srv = read_str("ProxyServer");
                 let prev_ov = read_str("ProxyOverride");
@@ -1294,7 +1294,10 @@ mod sysproxy {
                 KEEPALIVE.store(false, Ordering::Relaxed);
                 assert_eq!(enable, Some(1), "server={server:?}");
                 assert!(
-                    server.as_deref().unwrap_or("").contains("127.0.0.1:7887"),
+                    server
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains(&format!("127.0.0.1:{INBOUND_PORT}")),
                     "server={server:?}"
                 );
             }
